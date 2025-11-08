@@ -1,11 +1,11 @@
 # td_app.py — Soft-String Torque & Drag (Johancsik), 1-ft steps
-# Upgrades: multi-μ overlays, 3D well path, detailed report w/ equations & worked example,
-# full iteration trace CSV, and built-in accuracy self-checks.
+# Adds: step-by-step derivations, technical report, 3D path, multi-sheet Excel export.
 
 import math
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple, Dict
 from datetime import datetime
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -60,23 +60,18 @@ def areas_m2(od_in, id_in, ann_od_in):
     return ro, A_m, A_od, A_id, A_ann
 
 def buoyant_weight_N_per_m(steel_sg, mud_sg, ro_m, A_m, A_od, A_id):
-    # pipe immersed in fluid and filled with fluid (inside + outside buoyancy)
     rho_s = steel_sg * 1000.0
     rho_f = mud_sg * 1000.0
     return G * (rho_s * A_m - rho_f * A_od - rho_f * A_id)
 
-# ===== Survey handling =====
+# ===== Survey handling (Minimum Curvature) =====
 def resample_to_step(survey_df: pd.DataFrame, step_ft: float = 1.0) -> List[Segment]:
-    """Linearly resample MD/Inc/Azi to 1-ft spacing and build per-foot segments."""
     s = survey_df.sort_values("md_ft").reset_index(drop=True)
     md_min = int(round(s["md_ft"].iloc[0]))
     md_max = int(round(s["md_ft"].iloc[-1]))
     grid = np.arange(md_min, md_max + 1, step_ft)
-    md = s["md_ft"].values
-    inc = s["inc_deg"].values
-    azi = s["azi_deg"].values
-    inc_i = np.interp(grid, md, inc)
-    azi_i = np.interp(grid, md, azi)
+    inc_i = np.interp(grid, s["md_ft"], s["inc_deg"])
+    azi_i = np.interp(grid, s["md_ft"], s["azi_deg"])
     segs: List[Segment] = []
     for i in range(1, len(grid)):
         dmd = grid[i] - grid[i - 1]
@@ -86,7 +81,6 @@ def resample_to_step(survey_df: pd.DataFrame, step_ft: float = 1.0) -> List[Segm
     return segs
 
 def min_curvature_xyz(survey_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute TVD, North, East via minimum curvature (standard in wellpath calcs)."""
     s = survey_df.sort_values("md_ft").reset_index(drop=True).copy()
     s["tvd_ft"] = 0.0; s["north_ft"] = 0.0; s["east_ft"] = 0.0
     for i in range(1, len(s)):
@@ -137,13 +131,12 @@ def solve_soft_string(
             dF = W*math.cos(Ibar) + sec.mu*FN
         elif case.mode == "SL":
             dF = W*math.cos(Ibar) - sec.mu*FN
-        else:  # ROB (rotating off bottom)
+        else:  # ROB
             dF = W*math.cos(Ibar)
         F_n = F_next + dF
         dT = sec.mu * FN * (ro_m / FT2M)
         T_n = T_next + dT
 
-        # Store full trace row (we’ll show selected rows later)
         rows.append({
             "md_to_ft": s.md_ft, "Ibar_deg": s.inc_deg,
             "dI_rad": s.dinc_rad, "dPsi_rad": s.dazi_rad,
@@ -155,15 +148,12 @@ def solve_soft_string(
         F_profile.append(F_n); T_profile.append(T_n); md.append(s.md_ft)
         F_next, T_next = F_n, T_n
 
-    # Reverse arrays to surface→bit
     F_profile, T_profile, md = list(reversed(F_profile)), list(reversed(T_profile)), list(reversed(md))
     rows_surf_to_bit = list(reversed(rows))
 
-    # Pick selected rows to display
     shown_rows = []
     if trace and rows_surf_to_bit:
-        if trace_strategy == "all":
-            shown_rows = rows_surf_to_bit
+        if trace_strategy == "all": shown_rows = rows_surf_to_bit
         else:
             k = max(1, trace_rows // 2)
             shown_rows = rows_surf_to_bit[:k] + [{"...": "..."}] + rows_surf_to_bit[-k:]
@@ -196,137 +186,174 @@ def calibrate_mu_bisection(
         else: mu_lo = mu_mid
     return mu_mid, log
 
-# ===== Built-in accuracy self-checks =====
+# ===== Sanity checks (prove correctness) =====
 def run_self_checks(od, id_, ann, mud_ppg, steel_sg, base_mu):
-    # vertical well: inc=0 → friction term → 0 → hookload = WOB + buoyed weight
     df_vert = pd.DataFrame({"md_ft": [0, 10000], "inc_deg": [0, 0], "azi_deg": [0, 0]})
     segs = resample_to_step(df_vert, 1.0)
     sec = StringSection(0, 10000, od, id_, ann, mud_ppg, steel_sg, base_mu)
     case = LoadCase("PU", 50.0, 0.0)
     out = solve_soft_string(segs, sec, case, trace=False)
-    # theory for vertical: WOB + w_b * L
     ro_m, A_m, A_od, A_id, _ = areas_m2(od, id_, ann)
     mud_sg = ppg_to_sg(mud_ppg)
     wNpm = buoyant_weight_N_per_m(steel_sg, mud_sg, ro_m, A_m, A_od, A_id)
     w_lbf_ft = (wNpm/FT2M)*N2LBF
     theory = 50_000 + w_lbf_ft*10000
     err1 = abs(out["hookload_lbf"] - theory)/max(theory, 1)*100.0
-
-    # frictionless check: μ=0 → PU ~= SL
     sec.mu = 0.0
     out_pu = solve_soft_string(segs, sec, LoadCase("PU", 50.0, 0.0), trace=False)
     out_sl = solve_soft_string(segs, sec, LoadCase("SL", 50.0, 0.0), trace=False)
     diff = abs(out_pu["hookload_lbf"] - out_sl["hookload_lbf"])
-
     return {"vertical_err_pct": err1, "frictionless_diff_lbf": diff}
 
+# ===== Derivations (step-by-step text) =====
+def build_derivations(rows_surface_to_bit: List[dict], mode: str, n_head: int = 5, n_tail: int = 5) -> str:
+    lines = ["Step-by-step numeric derivations (surface → bit):"]
+    sel = rows_surface_to_bit[:n_head] + ([{"...":"..."}] if len(rows_surface_to_bit)>n_head+n_tail else []) + rows_surface_to_bit[-n_tail:]
+    for r in sel:
+        if "..." in r: lines.append("  ... (many similar 1-ft steps omitted) ..."); continue
+        Ibar = r["Ibar_deg"]; dI = r["dI_rad"]; dPsi = r["dPsi_rad"]; W = r["W_lbf"]
+        Fnext = r["F_next_lbf"]; FN = r["FN_lbf"]; mu = r["mu"]; dF = r["deltaF_lbf"]; Fn = r["F_n_lbf"]
+        dT = r["dT_lbf_ft"]; Tnext = r["T_next_lbf_ft"]; Tn = r["T_n_lbf_ft"]; md_to = r["md_to_ft"]
+        lines += [
+            f"MD→ {md_to:.1f} ft | Ī={Ibar:.2f}°, ΔI={dI:.4f} rad, Δψ={dPsi:.4f} rad",
+            f"  F_N = √[(F_next·Δψ·sinĪ)^2 + (F_next·ΔI + W·sinĪ)^2]",
+            f"      = √[({Fnext:.1f}*{dPsi:.4f}*sin{math.radians(Ibar):.4f})^2 + "
+            f"({Fnext:.1f}*{dI:.4f} + {W:.1f}*sin{math.radians(Ibar):.4f})^2] = {FN:.1f} lbf",
+        ]
+        if mode == "PU":
+            lines.append(f"  ΔF = W·cosĪ + μ·F_N = {W:.1f}*cos{math.radians(Ibar):.4f} + {mu:.3f}*{FN:.1f} = {dF:.1f} lbf")
+        elif mode == "SL":
+            lines.append(f"  ΔF = W·cosĪ − μ·F_N = {W:.1f}*cos{math.radians(Ibar):.4f} − {mu:.3f}*{FN:.1f} = {dF:.1f} lbf")
+        else:
+            lines.append(f"  ΔF = W·cosĪ = {W:.1f}*cos{math.radians(Ibar):.4f} = {dF:.1f} lbf")
+        lines += [
+            f"  F_n = F_next + ΔF = {Fnext:.1f} + {dF:.1f} = {Fn:.1f} lbf",
+            f"  ΔM = μ·F_N·r_o = {mu:.3f}*{FN:.1f}*r_o  →  ΔM = {dT:.1f} lbf·ft",
+            f"  M_n = M_next + ΔM = {Tnext:.1f} + {dT:.1f} = {Tn:.1f} lbf·ft",
+            ""
+        ]
+    return "\n".join(lines)
+
 # ===== Report builder =====
-def make_report_text(sec: StringSection, case: LoadCase, out: Dict,
+def make_report_text(team_names: str,
+                     methodology: str,
+                     assumptions: str,
+                     insights_user: str,
+                     sec: StringSection, case: LoadCase, out: Dict,
                      survey_xyz: pd.DataFrame,
                      header_help: Dict[str, str],
-                     mu_log: Optional[List[dict]] = None) -> str:
+                     mu_log: Optional[List[dict]] = None,
+                     derivations_text: Optional[str] = None,
+                     overlays: Optional[List[Dict]] = None) -> str:
+
     ro_m, A_m, A_od, A_id, _ = areas_m2(sec.od_in, sec.id_in, sec.ann_od_in)
     mud_sg = ppg_to_sg(sec.mud_ppg)
     wNpm = buoyant_weight_N_per_m(sec.steel_sg, mud_sg, ro_m, A_m, A_od, A_id)
     wNpf = wNpm / FT2M
 
-    # choose one representative step (surface-most) for numeric substitution
-    sample = next((r for r in out["trace_rows"] if "..." not in r), None)
+    # Auto insights (base + overlay sensitivity)
+    auto = []
+    auto.append(f"Base μ={sec.mu:.2f}: surface hookload {out['hookload_lbf']:.0f} lbf; surface torque {out['surface_torque_lbf_ft']:.0f} lbf·ft.")
+    if overlays:
+        hooks = [(o["mu"], o["out"]["hookload_lbf"]) for o in overlays]
+        torqs = [(o["mu"], o["out"]["surface_torque_lbf_ft"]) for o in overlays]
+        hooks_sorted = sorted(hooks); torqs_sorted = sorted(torqs)
+        auto.append(f"Hookload sensitivity μ: {hooks_sorted[0][0]:.2f}→{hooks_sorted[-1][0]:.2f} gives {hooks_sorted[0][1]:.0f}→{hooks_sorted[-1][1]:.0f} lbf at surface.")
+        auto.append(f"Torque sensitivity μ: {torqs_sorted[0][0]:.2f}→{torqs_sorted[-1][0]:.2f} gives {torqs_sorted[0][1]:.0f}→{torqs_sorted[-1][1]:.0f} lbf·ft.")
+
+    EQUATIONS = [
+        "Trajectory: Minimum Curvature (TVD/N/E/VS).",
+        "Buoyant unit weight:   w_b = g(ρ_s A_m − ρ_f A_od − ρ_f A_id).",
+        "Normal force:          F_N = √[(F_{n+1} Δψ sinĪ)^2 + (F_{n+1} ΔI + W sinĪ)^2].",
+        "Axial recursion (PU):  F_n = F_{n+1} + W cosĪ + μ F_N.",
+        "Axial recursion (SL):  F_n = F_{n+1} + W cosĪ − μ F_N.",
+        "ROB (static):          F_n = F_{n+1} + W cosĪ.",
+        "Torque increment:      ΔM = μ F_N r_o."
+    ]
 
     lines = []
     lines += [
-        f"Soft-String Torque & Drag — Report   ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+        f"Soft-String Torque & Drag — Technical Report   ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+        f"Team: {team_names}",
         "",
-        "=== Labeled Inputs ===",
-        f"Step = 1.0 ft | Mode = {case.mode}",
-        f"Pipe: OD={sec.od_in:.3f} in, ID={sec.id_in:.3f} in, Annulus OD={sec.ann_od_in:.3f} in",
-        f"Fluids/Materials: Mud = {sec.mud_ppg:.2f} ppg (SG={mud_sg:.3f}), Steel SG={sec.steel_sg:.2f}, μ={sec.mu:.3f}",
-        f"Loads at bit: WOB = {case.wob_klbf:.2f} klbf, Tbit = {case.tbit_kftlbf:.2f} kft-lbf",
-        f"Trajectory: MD range = {survey_xyz['md_ft'].min():.0f}–{survey_xyz['md_ft'].max():.0f} ft, max inc = {survey_xyz['inc_deg'].max():.1f}°",
+        "A. Results & Discussion",
+        "\n".join(auto),
+        insights_user if insights_user.strip() else "",
         "",
-        "=== Documented Formulas (Johancsik soft-string) ===",
-        "Buoyant unit weight:    w_b = g(ρ_s A_m − ρ_f A_od − ρ_f A_id)    [N/m]",
-        f" → A_m = π/4 (OD^2 − ID^2) = {A_m/(IN2M**2):.3f} in^2   (converted internally to m^2)",
-        f" → w_b = {wNpm:.1f} N/m = {wNpf*N2LBF:.2f} lbf/ft",
-        "Normal force (per foot): F_N = √[(F_{n+1} Δψ sinĪ)^2 + (F_{n+1} ΔI + W sinĪ)^2]",
-        "Axial recursion (PU):    F_n = F_{n+1} + W cosĪ + μ F_N",
-        "Axial recursion (SL):    F_n = F_{n+1} + W cosĪ − μ F_N",
-        "Static/ROB:              F_n = F_{n+1} + W cosĪ",
-        "Torque increment:        ΔM = μ F_N r_o",
+        "B. Engineering Insights (trends & sensitivities)",
+        "- PU vs SL spread grows with inclination and μ (sliding friction adds on PU, subtracts on SL).",
+        "- Higher mud weight reduces buoyant weight and thus hookload; friction trend depends on normal force × μ.",
+        "- Torque increases with inclination and μ; lateral sections dominate torque growth.",
         "",
-        "=== Worked example (one 1-ft step) ==="
+        "C. Methodology",
+        methodology,
+        "",
+        "D. Assumptions",
+        assumptions,
+        "",
+        "E. Equations Used",
+        *EQUATIONS,
+        f"\nMetal area A_m = π/4(OD^2−ID^2) = {A_m/(IN2M**2):.3f} in²; Buoyant unit weight = {wNpm:.1f} N/m = {wNpf*N2LBF:.2f} lbf/ft.",
+        "",
+        "F. Inputs Summary",
+        f"Mode={case.mode} | WOB={case.wob_klbf:.2f} klbf | Tbit={case.tbit_kftlbf:.2f} kft-lbf | μ={sec.mu:.3f}",
+        f"Pipe OD={sec.od_in:.3f} in, ID={sec.id_in:.3f} in, Annulus OD={sec.ann_od_in:.3f} in; Mud={sec.mud_ppg:.2f} ppg (SG={mud_sg:.3f}); Steel SG={sec.steel_sg:.2f}",
+        f"MD range: {survey_xyz['md_ft'].min():.0f}–{survey_xyz['md_ft'].max():.0f} ft; Max inc: {survey_xyz['inc_deg'].max():.1f}°",
+        "",
+        "G. Surface Results",
+        f"Hookload = {out['hookload_lbf']:.0f} lbf;  Surface torque = {out['surface_torque_lbf_ft']:.0f} lbf·ft.",
+        "",
+        "H. Iteration Trace (columns explained)",
+        ", ".join([f"{k}={v}" for k,v in TRACE_HEADER_HELP.items()]),
+        "",
+        "I. Step-by-step numeric derivations (subset)",
+        derivations_text if derivations_text else "(enable in UI)",
     ]
-    if sample and "..." not in sample:
-        Ibar = sample['Ibar_deg']; dI = sample['dI_rad']; dPsi = sample['dPsi_rad']
-        W = sample['W_lbf']; Fnext = sample['F_next_lbf']; mu = sample['mu']
-        FN = sample['FN_lbf']; dF = sample['deltaF_lbf']; Fn = sample['F_n_lbf']
-        dT = sample['dT_lbf_ft']; Tnext = sample['T_next_lbf_ft']
-        lines += [
-            f"Ī = {Ibar:.2f}°, ΔI = {dI:.4f} rad, Δψ = {dPsi:.4f} rad, W = {W:.1f} lbf, F_next = {Fnext:.0f} lbf, μ = {mu:.2f}",
-            f"F_N = √[(F_next·Δψ·sin Ī)^2 + (F_next·ΔI + W·sin Ī)^2] = {FN:.1f} lbf",
-            f"{case.mode}: ΔF = W·cos Ī {'+' if case.mode=='PU' else '-' if case.mode=='SL' else ''}{' μ·F_N' if case.mode!='ROB' else ''} = {dF:.1f} lbf → F_n = {Fn:.1f} lbf",
-            f"ΔM = μ·F_N·r_o = {dT:.1f} lbf·ft;  M_n = M_next + ΔM = {Tnext + dT:.1f} lbf·ft"
-        ]
-    else:
-        lines += ["(Trace unavailable for sample substitution.)"]
 
-    lines += [
-        "",
-        "=== Results (surface) ===",
-        f"Hookload = {out['hookload_lbf']:.0f} lbf",
-        f"Surface torque = {out['surface_torque_lbf_ft']:.0f} lbf·ft",
-        "",
-        "=== Iteration Trace (bottom → top, selected rows) ===",
-        "Columns: " + ", ".join(header_help.keys())
-    ]
-    # Include a few selected rows (already prepared)
-    for r in out["trace_rows"]:
-        if "..." in r:
-            lines.append("  ... (rows omitted) ...")
-        else:
-            lines.append(
-                f"{r['md_to_ft']:8.1f} | Ī={r['Ibar_deg']:6.2f}° | ΔI={r['dI_rad']:7.4f} | Δψ={r['dPsi_rad']:7.4f} | "
-                f"W={r['W_lbf']:7.1f} | F_next={r['F_next_lbf']:7.0f} | F_N={r['FN_lbf']:7.0f} | μ={r['mu']:4.2f} | "
-                f"ΔF={r['deltaF_lbf']:7.0f} | F_n={r['F_n_lbf']:7.0f} | M_next={r['T_next_lbf_ft']:8.0f} | "
-                f"ΔM={r['dT_lbf_ft']:6.1f} | M_n={r['T_n_lbf_ft']:8.0f}"
-            )
     if mu_log:
-        lines += ["", "=== μ-calibration iteration (bisection) ===", "iter   μ        hookload_pred(lbf)   error(lbf)"]
+        lines += ["", "J. μ-calibration log (bisection)", "iter   μ        hookload_pred(lbf)   error(lbf)"]
         for j in mu_log:
             lines.append(f"{j['iter']:>3d}  {j['mu']:.4f}   {j['hookload_pred_lbf']:>10.0f}         {j['error_lbf']:>+8.0f}")
 
-    lines += ["", "=== Column header explanations ==="]
-    for k, v in header_help.items():
-        lines.append(f"{k}: {v}")
-
     return "\n".join(lines)
 
-# ===== Header explanations for the trace table =====
+# ===== Trace header help (also appended in report) =====
 TRACE_HEADER_HELP = {
-    "md_to_ft": "End MD (ft) of the current 1‑ft segment (we march bottom→top).",
+    "md_to_ft": "End MD (ft) of the current 1-ft segment (we march bottom→top).",
     "Ibar_deg": "Segment inclination used for this step (deg).",
-    "dI_rad": "Change in inclination over the 1‑ft step (radians).",
-    "dPsi_rad": "Change in azimuth over the 1‑ft step (radians).",
+    "dI_rad": "Change in inclination over the 1-ft step (radians).",
+    "dPsi_rad": "Change in azimuth over the 1-ft step (radians).",
     "W_lbf": "Buoyant segment weight (lbf) for this foot.",
-    "F_next_lbf": "Axial force at the lower node (toward bit) before applying this step (lbf).",
+    "F_next_lbf": "Axial force at the lower node (toward bit) before this step (lbf).",
     "FN_lbf": "Normal (side) force from Johancsik discrete relation (lbf).",
-    "mu": "Friction factor used at this step (dimensionless).",
-    "deltaF_lbf": "Axial force change across the step (lbf). Mode‑dependent sign.",
+    "mu": "Friction factor (dimensionless).",
+    "deltaF_lbf": "Axial force change across the step (lbf). PU:+μFN; SL:−μFN; ROB:0.",
     "F_n_lbf": "Axial force at the upper node (toward surface) after this step (lbf).",
     "T_next_lbf_ft": "Torque at the lower node (lbf·ft) before this step.",
     "dT_lbf_ft": "Torque increase across the step (lbf·ft).",
     "T_n_lbf_ft": "Torque at the upper node (lbf·ft) after this step."
 }
 
-# ===== Streamlit UI =====
+# ===== UI =====
 st.set_page_config(page_title="Soft-String Torque & Drag (Johancsik)", layout="wide")
 st.title("Soft-String Torque & Drag — 1-ft steps (Johancsik)")
 
 with st.sidebar:
+    st.header("0) Team & Report")
+    team_names = st.text_input("Team names (comma-separated)", "")
+    methodology = st.text_area("Methodology (auto-fill allowed)", 
+        "Soft-string model (Johancsik). 1-ft discretization bottom→top. "
+        "Trajectory by Minimum Curvature. μ constant per run; optional bisection calibration to match measured hookload.")
+    assumptions = st.text_area("Assumptions (edit)", 
+        "Uniform μ along string; Coulomb friction with side-force F_N; pipe fully fluid-filled; "
+        "buoyancy inside & outside; no soft/hard string transition; no buckling included.")
+    insights_user = st.text_area("Your insights to show on top of report (optional)", 
+        "PU–SL spread increases with μ and inclination; higher mud weight reduces buoyant weight and thus lowers hookload.")
+
     st.header("1) Survey")
     src = st.radio("Source", ["Upload CSV", "Synthetic"], horizontal=True)
     if src == "Upload CSV":
-        st.caption("CSV columns required: md_ft, inc_deg, azi_deg")
+        st.caption("CSV required: md_ft, inc_deg, azi_deg")
         f = st.file_uploader("Upload survey CSV", type=["csv"])
         survey_df = pd.read_csv(f) if f else None
     else:
@@ -336,14 +363,12 @@ with st.sidebar:
             build = st.number_input("Build rate (°/100 ft)", 1.0, 10.0, 3.0, 0.5)
             target_inc = st.number_input("Target inclination (°)", 5.0, 90.0, 60.0, 1.0)
             az = st.number_input("Azimuth (°)", 0.0, 360.0, 0.0, 1.0)
-            survey_df = pd.DataFrame({"md_ft":[0.0], "inc_deg":[0.0], "azi_deg":[az]})
-            # build segment
-            md = [0.0]; inc=[0.0]; azi=[az]; step=100.0
+            md=[0.0]; inc=[0.0]; azi=[az]; step=100.0
             while md[-1] < total_md:
-                md_next = min(md[-1]+step, total_md)
-                inc_next = min(inc[-1]+build, target_inc) if inc[-1] < target_inc else inc[-1]
+                md_next=min(md[-1]+step,total_md)
+                inc_next=min(inc[-1]+build, target_inc) if inc[-1] < target_inc else inc[-1]
                 md.append(md_next); inc.append(inc_next); azi.append(az)
-            survey_df = pd.DataFrame({"md_ft":md,"inc_deg":inc,"azi_deg":azi})
+            survey_df=pd.DataFrame({"md_ft":md,"inc_deg":inc,"azi_deg":azi})
         elif synth_type == "S-curve":
             total_md = st.number_input("Total MD (ft)", 5000, 30000, 12000, 100)
             build = st.number_input("Build rate (°/100 ft)", 1.0, 10.0, 3.0, 0.5)
@@ -362,7 +387,6 @@ with st.sidebar:
             build = st.number_input("Build rate (°/100 ft)", 1.0, 10.0, 3.0, 0.5)
             lat = st.number_input("Lateral length (ft)", 500, 8000, 2000, 50)
             az = st.number_input("Azimuth (°)", 0.0, 360.0, 0.0, 1.0)
-            # build to 90°, then hold
             build_len = 90.0/build*100.0
             total_md = kop + build_len + lat
             md=[0.0]; inc=[0.0]; azi=[az]; step=100.0
@@ -382,7 +406,7 @@ with st.sidebar:
     steel_sg = st.number_input("Steel SG", 7.6, 8.1, 7.85, 0.01)
 
     st.header("3) Friction / Loads")
-    mu_base = st.number_input("Base friction factor μ (for trace/report)", 0.05, 0.80, 0.28, 0.01)
+    mu_base = st.number_input("Base friction μ (for trace/report)", 0.05, 0.80, 0.28, 0.01)
     mu_overlay_on = st.checkbox("Overlay multiple μ values (comma-separated)", value=True)
     mu_overlay_str = st.text_input("μ list (e.g., 0.20,0.30,0.40)", "0.20,0.30,0.40", disabled=not mu_overlay_on)
     mode = st.selectbox("Mode", ["PU", "SL", "ROB"])
@@ -391,6 +415,9 @@ with st.sidebar:
 
     st.header("4) Options")
     show_trace = st.checkbox("Show per-foot iteration trace (selected rows)", value=True)
+    show_deriv = st.checkbox("Include step-by-step numeric derivations in report", value=True)
+    deriv_head = st.number_input("Derivation head rows", 1, 50, 6, 1, disabled=not show_deriv)
+    deriv_tail = st.number_input("Derivation tail rows", 1, 50, 6, 1, disabled=not show_deriv)
     do_cal = st.checkbox("Calibrate μ to match a measured surface hookload?", value=False)
     target_hook = st.number_input("Target hookload (lbf)", 0, 500000, 180000, 1000, disabled=not do_cal)
     mu_lo = st.number_input("μ lower bound", 0.01, 0.80, 0.10, 0.01, disabled=not do_cal)
@@ -412,14 +439,13 @@ if run_btn:
     # 1-ft segments
     segs = resample_to_step(survey_df, step_ft=1.0)
 
-    # Base (trace/report) case
+    # Base case (used for trace & report)
     sec = StringSection(top_md_ft=float(survey_df["md_ft"].min()),
                         shoe_md_ft=float(survey_df["md_ft"].max()),
                         od_in=od, id_in=id_, ann_od_in=ann, mud_ppg=mud_ppg,
                         steel_sg=steel_sg, mu=mu_base)
     case = LoadCase(mode=mode, wob_klbf=wob, tbit_kftlbf=tbit)
 
-    # Optional μ calibration
     mu_log = None
     if do_cal:
         mu_star, mu_log = calibrate_mu_bisection(segs, sec, case, hookload_target_lbf=target_hook,
@@ -427,10 +453,9 @@ if run_btn:
         st.info(f"Calibrated μ ≈ {mu_star:.4f} (to match {target_hook} lbf). Re-running with μ* …")
         sec.mu = mu_star
 
-    # Solve base
     out_base = solve_soft_string(segs, sec, case, trace=show_trace, trace_strategy="ends", trace_rows=12)
 
-    # Multi-μ overlays
+    # μ overlays
     overlays = []
     if mu_overlay_on and mu_overlay_str.strip():
         try:
@@ -444,7 +469,7 @@ if run_btn:
             st.warning("Could not parse μ list; showing base case only.")
             overlays = []
 
-    # 3D well path (TVD vs North/East)
+    # 3D well path
     survey_xyz = min_curvature_xyz(survey_df)
     fig3d = go.Figure(data=[go.Scatter3d(
         x=survey_xyz["east_ft"], y=survey_xyz["north_ft"], z=survey_xyz["tvd_ft"],
@@ -455,13 +480,13 @@ if run_btn:
     fig3d.update_layout(title="3D Well Path (colored by inclination)",
                         scene=dict(
                             xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
-                            zaxis=dict(autorange="reversed")  # depth downwards
+                            zaxis=dict(autorange="reversed")
                         ))
-    # Plots: 2D trajectory, Inc/Azi, Hookload, Torque
+
+    # 2D trajectory & surveys
     col1, col2 = st.columns(2)
     with col1:
-        fig1 = px.line(survey_xyz, x="vs_ft", y="tvd_ft",
-                       title="Trajectory: TVD vs Vertical Section (VS)",
+        fig1 = px.line(survey_xyz, x="vs_ft", y="tvd_ft", title="Trajectory: TVD vs Vertical Section (VS)",
                        labels={"vs_ft":"VS (ft)", "tvd_ft":"TVD (ft)"})
         fig1.update_yaxes(autorange="reversed")
         st.plotly_chart(fig1, use_container_width=True)
@@ -474,23 +499,19 @@ if run_btn:
 
     st.plotly_chart(fig3d, use_container_width=True)
 
-    # Hookload vs MD
+    # Hookload vs MD (with overlays)
     figF = go.Figure()
-    figF.add_trace(go.Scatter(x=out_base["md_ft"], y=out_base["F_lbf"],
-                              name=f"{mode} μ={sec.mu:.2f}", mode="lines"))
+    figF.add_trace(go.Scatter(x=out_base["md_ft"], y=out_base["F_lbf"], name=f"{mode} μ={sec.mu:.2f}", mode="lines"))
     for o in overlays:
-        figF.add_trace(go.Scatter(x=o["out"]["md_ft"], y=o["out"]["F_lbf"],
-                                  name=f"{mode} μ={o['mu']:.2f}", mode="lines"))
+        figF.add_trace(go.Scatter(x=o["out"]["md_ft"], y=o["out"]["F_lbf"], name=f"{mode} μ={o['mu']:.2f}", mode="lines"))
     figF.update_layout(title=f"{mode} Hookload vs MD", xaxis_title="MD (ft)", yaxis_title="Force (lbf)")
     st.plotly_chart(figF, use_container_width=True)
 
-    # Torque vs MD
+    # Torque vs MD (with overlays)
     figT = go.Figure()
-    figT.add_trace(go.Scatter(x=out_base["md_ft"], y=out_base["T_lbf_ft"],
-                              name=f"{mode} μ={sec.mu:.2f}", mode="lines"))
+    figT.add_trace(go.Scatter(x=out_base["md_ft"], y=out_base["T_lbf_ft"], name=f"{mode} μ={sec.mu:.2f}", mode="lines"))
     for o in overlays:
-        figT.add_trace(go.Scatter(x=o["out"]["md_ft"], y=o["out"]["T_lbf_ft"],
-                                  name=f"{mode} μ={o['mu']:.2f}", mode="lines"))
+        figT.add_trace(go.Scatter(x=o["out"]["md_ft"], y=o["out"]["T_lbf_ft"], name=f"{mode} μ={o['mu']:.2f}", mode="lines"))
     figT.update_layout(title=f"{mode} Torque vs MD", xaxis_title="MD (ft)", yaxis_title="Torque (lbf·ft)")
     st.plotly_chart(figT, use_container_width=True)
 
@@ -499,13 +520,22 @@ if run_btn:
         st.subheader("Iteration trace (selected rows)")
         st.dataframe(pd.DataFrame(out_base["trace_rows"]))
 
-    # Results summary
+    # Step-by-step derivations
+    deriv_text = ""
+    if show_deriv:
+        deriv_text = build_derivations(out_base["trace_rows_full"], case.mode, deriv_head, deriv_tail)
+        with st.expander("Step-by-step numeric derivations (printable)"):
+            st.code(deriv_text, language="text")
+        st.download_button("Download derivations (txt)", deriv_text.encode("utf-8"),
+                           file_name="td_derivations.txt")
+
+    # Summary
     st.success(
-        f"Surface Hookload ({mode}) = {out_base['hookload_lbf']:.0f} lbf   |   "
+        f"Surface Hookload ({case.mode}) = {out_base['hookload_lbf']:.0f} lbf   |   "
         f"Surface Torque = {out_base['surface_torque_lbf_ft']:.0f} lbf·ft"
     )
 
-    # Optional self-checks
+    # Self checks
     if run_checks:
         chk = run_self_checks(od, id_, ann, mud_ppg, steel_sg, sec.mu)
         if chk["vertical_err_pct"] < 0.5:
@@ -517,28 +547,69 @@ if run_btn:
         else:
             st.warning(f"Frictionless check: PU-SL difference {chk['frictionless_diff_lbf']:.1f} lbf (expected ~0).")
 
-    # Report text
-    report_text = make_report_text(sec, case, out_base, survey_xyz, TRACE_HEADER_HELP, mu_log=mu_log)
-    st.download_button("Download report (txt)", report_text.encode("utf-8"), file_name="td_report.txt")
+    # Build technical report text
+    report_text = make_report_text(team_names, methodology, assumptions, insights_user,
+                                   sec, case, out_base, survey_xyz, TRACE_HEADER_HELP,
+                                   mu_log=mu_log, derivations_text=deriv_text, overlays=overlays)
+    st.download_button("Download technical report (txt)", report_text.encode("utf-8"), file_name="td_report.txt")
 
-    # Exports
-    curves = pd.DataFrame({"md_ft": out_base["md_ft"],
-                           "F_lbf": out_base["F_lbf"],
-                           "T_lbf_ft": out_base["T_lbf_ft"]})
+    # CSV exports
+    curves = pd.DataFrame({"md_ft": out_base["md_ft"], "F_lbf": out_base["F_lbf"], "T_lbf_ft": out_base["T_lbf_ft"]})
     st.download_button("Download curves (CSV)", curves.to_csv(index=False).encode("utf-8"), file_name="td_curves.csv")
-
-    # Full trace CSV (surface→bit)
     trace_full_df = pd.DataFrame(out_base["trace_rows_full"])
     st.download_button("Download full iteration trace (CSV)", trace_full_df.to_csv(index=False).encode("utf-8"),
                        file_name="td_trace_full.csv")
+
+    # Excel workbook (multi-sheet)
+    with BytesIO() as buffer:
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            # Inputs
+            pd.DataFrame({
+                "Parameter":["Team","Mode","WOB_klbf","Tbit_kftlbf","μ","Pipe_OD_in","Pipe_ID_in","Annulus_OD_in",
+                             "Mud_ppg","Steel_SG","MD_min_ft","MD_max_ft","Max_inc_deg"],
+                "Value":[team_names, case.mode, case.wob_klbf, case.tbit_kftlbf, sec.mu, od, id_, ann,
+                         mud_ppg, steel_sg, survey_xyz["md_ft"].min(), survey_xyz["md_ft"].max(),
+                         survey_xyz["inc_deg"].max()]
+            }).to_excel(writer, sheet_name="Inputs", index=False)
+
+            # Equations
+            eq = pd.DataFrame({"Equation":[
+                "Minimum Curvature for TVD/N/E/VS",
+                "w_b = g(ρ_s A_m − ρ_f A_od − ρ_f A_id)",
+                "F_N = √[(F_{n+1} Δψ sinĪ)^2 + (F_{n+1} ΔI + W sinĪ)^2]",
+                "PU:  F_n = F_{n+1} + W cosĪ + μ F_N",
+                "SL:  F_n = F_{n+1} + W cosĪ − μ F_N",
+                "ROB: F_n = F_{n+1} + W cosĪ",
+                "ΔM = μ F_N r_o"
+            ]})
+            eq.to_excel(writer, sheet_name="Equations", index=False)
+
+            # Curves & Trace
+            curves.to_excel(writer, sheet_name="Curves", index=False)
+            trace_full_df.to_excel(writer, sheet_name="Trace", index=False)
+
+            # SelfChecks
+            sc = run_checks and run_self_checks(od, id_, ann, mud_ppg, steel_sg, sec.mu) or {}
+            pd.DataFrame([sc]).to_excel(writer, sheet_name="SelfChecks", index=False)
+
+            # Report (single cell)
+            ws = writer.book.add_worksheet("Report")
+            ws.write_string(0, 0, report_text)
+            ws.set_column(0, 0, 110)
+            ws.set_row(0, 200)
+
+        st.download_button("Download Excel workbook (.xlsx)", buffer.getvalue(),
+                           file_name="td_results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # Footer / Help
 st.markdown("---")
 with st.expander("How to use this app"):
     st.markdown("""
-**Step 1 — Survey**: Upload CSV with `md_ft, inc_deg, azi_deg` **or** pick a Synthetic profile.  
-**Step 2 — String/Fluid**: Enter pipe OD/ID, annulus OD (hole/casing ID), mud (ppg), steel SG.  
-**Step 3 — Friction & Loads**: Pick μ (base), optionally add multiple μ values to overlay; select PU/SL/ROB; set WOB, bit torque.  
-**Step 4 — Run**: See 2D & 3D trajectory, Hookload/Torque, iteration trace; optionally calibrate μ to match a measured surface hookload; download report & CSVs.
+**Step 0 — Team & Report**: Fill team names and (optionally) edit methodology/assumptions/insights.  
+**Step 1 — Survey**: Upload `md_ft, inc_deg, azi_deg` or choose a Synthetic profile.  
+**Step 2 — String/Fluid**: Pipe OD/ID, annulus OD (hole/casing ID), mud (ppg), steel SG.  
+**Step 3 — Friction & Loads**: Select μ (and optional overlays), PU/SL/ROB, WOB, bit torque.  
+**Step 4 — Options**: Show trace, include step-by-step derivations, enable μ-calibration and self-checks.  
+**Run**: Get 2D & 3D trajectory, Hookload/Torque vs MD, trace table, derivations, and downloads (TXT/CSV/XLSX).
 """)
-st.caption("Method: Johancsik soft-string (SPE-11380). 1-ft discretization. Trajectory via Minimum Curvature.")
+st.caption("Method: Johancsik soft-string (SPE-11380) with 1-ft steps; trajectory via Minimum Curvature.")

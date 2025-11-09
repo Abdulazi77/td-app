@@ -1,0 +1,17 @@
+{
+  "units": ["field (ft, deg)", "metric (m, deg)"],
+  "well_types": [
+    "Build & Hold",
+    "Build & Hold & Drop",
+    "Horizontal (Continuous Build + Lateral)"
+  ],
+  "build_rates_deg_per_100ft": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0],
+  "drop_rates_deg_per_100ft": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0],
+  "course_lengths_ft": [10, 20, 30, 50, 100],
+  "quick_azimuths": [
+    {"label": "North (0)", "deg": 0},
+    {"label": "East (90)", "deg": 90},
+    {"label": "South (180)", "deg": 180},
+    {"label": "West (270)", "deg": 270}
+  ]
+}

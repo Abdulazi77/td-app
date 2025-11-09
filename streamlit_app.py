@@ -1,10 +1,16 @@
-# streamlit_app.py — Wellpath + Torque & Drag with 1 ft steps and casing program
-# Tabs:
-#   1) Trajectory (3D) — Minimum Curvature Method (MCM), Δs = 1 ft
-#   2) Torque & Drag (soft-string, Johancsik) with cased vs open-hole split
-#   + Wellbore schematic with standard API casing dropdowns (OD → lb/ft → ID) + Grade + setting depth
+# streamlit_app.py — PEGN517 Wellpath + T&D
+# - Minimum Curvature (Δs = 1 ft)
+# - Casing program (OD -> lb/ft -> ID, Grade, Shoe MD)
+# - 3D "schematic": wellpath colored by casing intervals, thicker for larger (shallower) strings
+# - Soft-string Torque/Drag (Johancsik) with cased vs open-hole friction split by deepest shoe
 #
-# Keep requirements lean (streamlit, plotly). Works on Python 3.12 Community Cloud.
+# Python 3.12, Streamlit Cloud friendly (minimal deps).
+# References (see app footer):
+#   - Minimum Curvature & RF (ratio factor), DLS definitions
+#   - Johancsik soft-string torque/drag
+#   - Buoyancy factor BF = (65.5 - MW)/65.5
+#   - API RP 7G (envelope guidance)
+#   - Streamlit st.rerun()
 
 import math
 from typing import Tuple, List, Dict, Optional
@@ -16,15 +22,11 @@ st.set_page_config(page_title="Wellpath + Torque & Drag — PEGN517", layout="wi
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
-# -------------------------------------------------------------------
-# Minimal standard casing database (OD → list of {ppf, id})
-# Values compiled from World Oil casing tables and common API 5CT charts (see app footer).
-# Note: ID is a function of nominal OD and lb/ft (wall thickness); Grade does not change ID.
-# You can extend this safely by adding more weights/IDs per nominal OD.
-# Units: inches for OD/ID, lb/ft for ppf.
-# -------------------------------------------------------------------
+# ------------------------------
+# Small, standard casing library
+# ------------------------------
+# OD label -> [{"ppf": .., "id": ..}, ...] ; Grade list (typical availability)
 CASING_DB: Dict[str, Dict[str, List[Dict[str, float]]]] = {
-    # 'grades' are typical availability; not exhaustive but standard.
     "13-3/8": {
         "grades": ["J55", "K55", "N80", "L80", "P110"],
         "options": [
@@ -72,7 +74,7 @@ CASING_DB: Dict[str, Dict[str, List[Dict[str, float]]]] = {
         "grades": ["J55", "K55", "N80", "L80", "P110"],
         "options": [
             {"ppf": 14.0,  "id": 4.892},
-            {"ppf": 17.0,  "id": 4.778},  # common
+            {"ppf": 17.0,  "id": 4.778},
             {"ppf": 20.0,  "id": 4.670},
             {"ppf": 23.0,  "id": 4.563},
             {"ppf": 26.0,  "id": 4.494},
@@ -89,10 +91,22 @@ CASING_DB: Dict[str, Dict[str, List[Dict[str, float]]]] = {
     },
 }
 
+# --------------------------
+# Utility: parse OD label
+# --------------------------
+def parse_od_inch(label: str) -> float:
+    # "9-5/8" -> 9.625, "7" -> 7.0
+    if "-" in label:
+        whole, frac = label.split("-")
+        num, den = frac.split("/")
+        return float(whole) + float(num) / float(den)
+    return float(label)
+
 # =========================================================
-# Minimum Curvature Method (Δs = 1 ft synthetic generation)
+# Minimum Curvature Method (Δs = 1 ft piecewise generation)
 # =========================================================
 def _rf(dogs_rad: float) -> float:
+    # Ratio Factor RF = 2/dogs * tan(dogs/2)
     if abs(dogs_rad) < 1e-12:
         return 1.0
     return 2.0 / dogs_rad * math.tan(0.5 * dogs_rad)
@@ -122,16 +136,15 @@ def mcm_positions(md: List[float], inc: List[float], az: List[float]):
         north.append(n2); east.append(e2); tvd.append(t2); dls.append(d)
     return north, east, tvd, dls
 
-# --------- Synthetic profiles (Δs forced to 1 ft) ----------
 def _gen_md(target_md: float, ds: float = 1.0) -> List[float]:
-    # [0, 1, 2, ..., target_md] inclusive
     steps = int(max(0.0, target_md) // ds)
     md = [i * ds for i in range(steps + 1)]
     if md[-1] < target_md:
         md.append(target_md)
     return md
 
-def synth_build_hold(kop_md, build_rate, theta_hold, target_md, az_deg) -> Tuple[List[float], List[float], List[float]]:
+# Synthetic well builders (Δs fixed to 1 ft)
+def synth_build_hold(kop_md, build_rate, theta_hold, target_md, az_deg):
     ds = 1.0
     md = _gen_md(target_md, ds)
     inc = []
@@ -140,18 +153,17 @@ def synth_build_hold(kop_md, build_rate, theta_hold, target_md, az_deg) -> Tuple
             inc.append(0.0)
         else:
             prev = inc[-1] if inc else 0.0
-            nxt = min(prev + build_rate * (ds/100.0), theta_hold)
-            inc.append(nxt)
+            inc.append(min(prev + build_rate * (ds/100.0), theta_hold))
     az = [az_deg] * len(md)
     return md, inc, az
 
 def synth_build_hold_drop(kop_md, build_rate, theta_hold, hold_len, drop_rate,
-                          final_inc, target_md, az_deg) -> Tuple[List[float], List[float], List[float]]:
+                          final_inc, target_md, az_deg):
     ds = 1.0
     md = _gen_md(target_md, ds)
     inc = []
     built = False; in_hold = False; in_drop = False; hold_left = hold_len or 0.0
-    for i, m in enumerate(md):
+    for m in md:
         if m < kop_md:
             inc.append(0.0); continue
         prev = inc[-1] if inc else 0.0
@@ -173,17 +185,14 @@ def synth_build_hold_drop(kop_md, build_rate, theta_hold, hold_len, drop_rate,
     az = [az_deg] * len(md)
     return md, inc, az
 
-def synth_horizontal(kop_md, build_rate, lateral_len, target_md, az_deg) -> Tuple[List[float], List[float], List[float]]:
+def synth_horizontal(kop_md, build_rate, lateral_len, target_md, az_deg):
     ds = 1.0
-    # if target_md not given, estimate: build to 90 then lateral length
     if target_md is None:
-        # conservative max build length if build_rate small:
         build_len = math.ceil(90.0 / (build_rate / 100.0))
         target_md = kop_md + build_len + (lateral_len or 0.0)
     md = _gen_md(target_md, ds)
-    inc = []
-    built90 = False
-    for i, m in enumerate(md):
+    inc, built90 = [], False
+    for m in md:
         if m < kop_md:
             inc.append(0.0); continue
         prev = inc[-1] if inc else 0.0
@@ -196,13 +205,15 @@ def synth_horizontal(kop_md, build_rate, lateral_len, target_md, az_deg) -> Tupl
     az = [az_deg] * len(md)
     return md, inc, az
 
-# ======================================================
-# Soft-string Torque & Drag (Johancsik; stepwise)
-# ======================================================
+# ==============================================
+# Soft-string Torque & Drag (Johancsik stepwise)
+# ==============================================
 def buoyancy_factor_ppg(mw_ppg: float) -> float:
+    # BF = (65.5 - MW) / 65.5
     return max(0.0, min(1.0, (65.5 - float(mw_ppg)) / 65.5))
 
 def kappa_from_dls(dls_deg_per_100ft: float) -> float:
+    # κ [rad/ft] from DLS [deg/100 ft]
     return (dls_deg_per_100ft * DEG2RAD) / 100.0
 
 def solve_torque_drag(md: List[float], inc_deg: List[float], dls_deg_100: List[float],
@@ -228,14 +239,14 @@ def solve_torque_drag(md: List[float], inc_deg: List[float], dls_deg_100: List[f
     use_dp   = max(0.0, min(dp_len, bit_depth - use_dc - use_hwdp))
 
     def comp_at_md(m: float):
-        # Return (w_air, od_in). From bit upward: DC -> HWDP -> DP.
+        # Return (w_air, od_in). From bit upward: DC -> HWDP -> DP
         if m > (bit_depth - use_dc):              return dc_w_air, dc_od_in
         elif m > (bit_depth - use_dc - use_hwdp): return hwdp_w_air, hwdp_od_in
         else:                                     return dp_w_air, dp_od_in
 
     BF = buoyancy_factor_ppg(mw_ppg)
     sigma_ax = +1.0 if scenario.lower().startswith("pick") else -1.0
-    T = [-float(wob_lbf) if wob_lbf > 0 and scenario.lower().startswith("rotate on") else 0.0]
+    T = [-float(wob_lbf) if wob_lbf > 0 and scenario.lower().startswith("rotate on") else 0.0]  # at bit
     M = [float(bit_torque_lbf_ft) if scenario.lower().startswith("rotate on") else 0.0]
 
     rows: List[Dict] = []
@@ -245,7 +256,6 @@ def solve_torque_drag(md: List[float], inc_deg: List[float], dls_deg_100: List[f
         md2, md1 = md[i], md[i-1]
         ds = md2 - md1
         th = theta[i] * DEG2RAD
-        dls = dls_deg_100[i]
         kap = kappa[i]
         w_air, od_in = comp_at_md(md2)
         w_b = w_air * BF
@@ -255,16 +265,20 @@ def solve_torque_drag(md: List[float], inc_deg: List[float], dls_deg_100: List[f
         mu_slide = (mu_open_slide if in_open else mu_cased_slide)
         mu_rot   = (mu_rot_open  if in_open else mu_rot_cased)
 
+        # Normal force per length: N = w_b sinθ + T κ   (Johancsik)
         N = w_b * math.sin(th) + T[-1] * kap
+
+        # Axial update: T_{i+1} = T_i + (σ_ax w_b cosθ + μ N) Δs
         dT = (sigma_ax * w_b * math.cos(th) + mu_slide * N) * ds
         T_next = T[-1] + dT
 
+        # Torque update: M_{i+1} = M_i + μ_rot N r_eff Δs
         dM = (mu_rot * N * r_eff_ft) * ds
         M_next = M[-1] + dM
 
         rows.append({
             "md_top_ft": md1, "md_bot_ft": md2, "ds_ft": ds,
-            "inc_deg": theta[i], "dls_deg_100ft": dls, "kappa_rad_ft": kap,
+            "inc_deg": theta[i], "kappa_rad_ft": kap,
             "w_air_lbft": w_air, "BF": BF, "w_b_lbft": w_b,
             "mu_slide": mu_slide, "mu_rot": mu_rot,
             "N_lbf": N, "dT_lbf": dT, "T_next_lbf": T_next,
@@ -280,35 +294,28 @@ def solve_torque_drag(md: List[float], inc_deg: List[float], dls_deg_100: List[f
     return {"T_lbf_along": T, "M_lbf_ft_along": M, "trace_rows": rows,
             "surface_hookload_lbf": surf_hookload, "surface_torque_lbf_ft": surf_torque}
 
-# -------------------- helpers --------------------
-def interp_tvd_at_md(md_list: List[float], tvd_list: List[float], target_md: float) -> float:
-    # linear interpolate TVD at given MD (assumes md_list sorted)
-    if target_md <= md_list[0]: return tvd_list[0]
-    if target_md >= md_list[-1]: return tvd_list[-1]
-    # binary search for speed (lists can be long at 1 ft)
-    lo, hi = 0, len(md_list)-1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        if md_list[mid] < target_md: lo = mid + 1
-        else: hi = mid - 1
-    i = max(1, lo)
-    md1, md2 = md_list[i-1], md_list[i]
-    tv1, tv2 = tvd_list[i-1], tvd_list[i]
-    t = 0.0 if md2 == md1 else (target_md - md1)/(md2 - md1)
-    return tv1 + t*(tv2 - tv1)
-
+# ------------
+# Plot helpers
+# ------------
 def decimate(xs: List[float], factor: int) -> List[float]:
     k = max(1, int(factor))
     return xs[::k]
 
+def segment_indices(md: List[float], top_md: float, bot_md: float) -> List[int]:
+    idx = []
+    for i, m in enumerate(md):
+        if m >= top_md - 1e-9 and m <= bot_md + 1e-9:
+            idx.append(i)
+    return idx
+
 # =====================  UI  =====================
 st.title("Wellpath + Torque & Drag (Δs = 1 ft)")
 
-tab1, tab2 = st.tabs(["1) Trajectory & Schematic", "2) Torque & Drag"])
+tab1, tab2 = st.tabs(["1) Trajectory & 3D Casing Schematic", "2) Torque & Drag"])
 
 # -------------------- Tab 1 --------------------
 with tab1:
-    st.subheader("Synthetic survey (Minimum Curvature, 1 ft increments)")
+    st.subheader("Synthetic survey (Minimum Curvature)")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -342,38 +349,17 @@ with tab1:
 
     # ----------- Casing program (linked dropdowns) -----------
     st.markdown("### Casing program (optional)")
-    st.caption("Select nominal OD, then choose a weight (lb/ft); ID fills automatically. Pick a grade and setting depth (MD ft).")
+    st.caption("Pick nominal OD → choose a weight (lb/ft) → ID fills automatically. Select grade and shoe MD (ft).")
     if "casing_rows" not in st.session_state:
-        st.session_state["casing_rows"] = 1  # start with one row
-    cols = st.columns([1.2, 1.2, 1.0, 1.0, 1.2, 1.2])
-    cols[0].markdown("**Nominal OD**")
-    cols[1].markdown("**lb/ft**")
-    cols[2].markdown("**ID (in)**")
-    cols[3].markdown("**Grade**")
-    cols[4].markdown("**Setting depth (MD ft)**")
-    cols[5].markdown("**Actions**")
+        st.session_state["casing_rows"] = 1  # start with one string
 
-    def render_casing_row(idx: int):
-        key_prefix = f"casing_{idx}_"
-        ods = list(CASING_DB.keys())
-        od = st.selectbox("Nominal OD", ods, key=key_prefix+"od")
-        # weights linked to OD
-        ppf_list = [opt["ppf"] for opt in CASING_DB[od]["options"]]
-        ppf = st.selectbox("lb/ft", [f"{ppf:.2f}".rstrip('0').rstrip('.') for ppf in ppf_list],
-                           key=key_prefix+"ppf")
-        # ID auto
-        sel = next(x for x in CASING_DB[od]["options"] if f"{x['ppf']:.2f}".rstrip('0').rstrip('.') == ppf)
-        id_in = sel["id"]
-        # grade pick
-        grade = st.selectbox("Grade", CASING_DB[od]["grades"], key=key_prefix+"grade")
-        # setting depth
-        depth = st.number_input("Setting depth (MD ft)", min_value=0.0, value=3000.0, step=50.0, key=key_prefix+"depth")
-        return {"od": od, "ppf": float(ppf), "id": id_in, "grade": grade, "shoe_md": depth}
+    cols = st.columns([1.2, 1.2, 1.0, 1.0, 1.2, 1.2])
+    cols[0].markdown("**Nominal OD**"); cols[1].markdown("**lb/ft**"); cols[2].markdown("**ID (in)**")
+    cols[3].markdown("**Grade**"); cols[4].markdown("**Setting depth (MD ft)**"); cols[5].markdown("**Actions**")
 
     casing_rows: List[Dict] = []
     for i in range(st.session_state["casing_rows"]):
         c0,c1,c2,c3,c4,c5 = st.columns([1.2,1.2,1.0,1.0,1.2,1.2])
-        with c0: pass  # headings already above
         with c0: od = st.selectbox("", list(CASING_DB.keys()), key=f"od_{i}")
         with c1:
             opts = CASING_DB[od]["options"]
@@ -389,20 +375,21 @@ with tab1:
         with c5:
             if st.button("➖ Remove", key=f"rem_{i}"):
                 st.session_state["casing_rows"] = max(0, st.session_state["casing_rows"]-1)
-                st.experimental_rerun()
+                st.rerun()
         casing_rows.append({"od": od, "ppf": float(ppf), "id": sel["id"], "grade": grade, "shoe_md": depth})
+
     add_cols = st.columns([6,1])
     with add_cols[1]:
         if st.button("➕ Add string"):
             st.session_state["casing_rows"] = min(6, st.session_state["casing_rows"]+1)
-            st.experimental_rerun()
+            st.rerun()
 
-    st.markdown("— Using **Δs = 1 ft course length** for all piecewise MCM calculations.")
+    st.caption("Using Δs = 1 ft for all piecewise MCM calculations.")
 
-    go_traj = st.button("Compute trajectory & schematic")
+    go_traj = st.button("Compute trajectory & 3D schematic")
 
     if go_traj:
-        # Build survey
+        # Build the survey
         if profile == "Build & Hold":
             md, inc, az = synth_build_hold(kop_md, build_rate, theta_hold, target_md, az_deg)
         elif profile == "Build & Hold & Drop":
@@ -411,34 +398,64 @@ with tab1:
             md, inc, az = synth_horizontal(kop_md, build_rate, lat_len, target_md, az_deg)
 
         north, east, tvd, dls = mcm_positions(md, inc, az)
-
-        # Store for T&D tab reuse
         st.session_state["last_traj"] = (md, inc, az, dls, tvd, north, east)
         st.session_state["casing_program"] = casing_rows
 
-        # --- 3D + 2D plots (decimate only for plotting if long) ---
+        # 3D wellpath split by casing intervals (legend, thickness by OD; open hole brown)
         import plotly.graph_objects as go
-        plot_factor = max(1, len(md)//5000)
-        md_p   = decimate(md,   plot_factor)
-        tvd_p  = decimate(tvd,  plot_factor)
-        north_p= decimate(north,plot_factor)
-        east_p = decimate(east, plot_factor)
+
+        # Sort casing by shoe depth (ascending = shallower first)
+        cas_sorted = sorted([r for r in casing_rows if r["shoe_md"] > 0], key=lambda x: x["shoe_md"])
+        colors = ["#4C78A8", "#F58518", "#54A24B", "#EECA3B", "#B279A2", "#FF9DA6"]  # casing palette
+        openhole_color = "#8B4513"  # brown
 
         fig3d = go.Figure()
-        fig3d.add_trace(go.Scatter3d(x=east_p, y=north_p, z=[-x for x in tvd_p],
-                                     mode="lines", line=dict(width=6), name="Well path"))
-        fig3d.update_layout(title="3D Well Trajectory",
-                            scene=dict(xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft, down)"),
-                            margin=dict(l=0,r=0,t=40,b=0))
+        start_md = 0.0
+        for idx, row in enumerate(cas_sorted):
+            end_md = row["shoe_md"]
+            inds = [k for k,m in enumerate(md) if m >= start_md-1e-9 and m <= end_md+1e-9]
+            if len(inds) >= 2:
+                od_in = parse_od_inch(row["od"])
+                width_px = max(2, int(2 + od_in/3.0))  # thicker for larger OD
+                fig3d.add_trace(go.Scatter3d(
+                    x=[east[k] for k in inds],
+                    y=[north[k] for k in inds],
+                    z=[-tvd[k] for k in inds],
+                    mode="lines",
+                    line=dict(width=width_px, color=colors[idx % len(colors)]),
+                    name=f"{row['od']} {row['ppf']}# {row['grade']} to {int(end_md)} ft"
+                ))
+            start_md = end_md
 
+        # Open hole from deepest shoe to TD
+        deepest = cas_sorted[-1]["shoe_md"] if cas_sorted else 0.0
+        inds_oh = [k for k,m in enumerate(md) if m >= deepest-1e-9]
+        if len(inds_oh) >= 2:
+            fig3d.add_trace(go.Scatter3d(
+                x=[east[k] for k in inds_oh],
+                y=[north[k] for k in inds_oh],
+                z=[-tvd[k] for k in inds_oh],
+                mode="lines",
+                line=dict(width=4, color=openhole_color),
+                name=f"Open hole (below {int(deepest)} ft)"
+            ))
+
+        fig3d.update_layout(
+            title="3D Trajectory — Casing Schematic by Interval",
+            scene=dict(xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft, down)"),
+            legend=dict(itemsizing="constant"),
+            margin=dict(l=0,r=0,t=40,b=0)
+        )
+
+        # 2D quick views (undecimated for accuracy; plots stay light with WebGL)
         prof = go.Figure()
-        prof.add_trace(go.Scatter(x=md_p, y=tvd_p, mode="lines", name="Profile"))
+        prof.add_trace(go.Scatter(x=md, y=tvd, mode="lines", name="TVD vs MD"))
         prof.update_yaxes(autorange="reversed")
-        prof.update_layout(title="Profile: TVD vs MD", xaxis_title="MD (ft)", yaxis_title="TVD (ft)")
+        prof.update_layout(title="Profile", xaxis_title="MD (ft)", yaxis_title="TVD (ft)")
 
         plan = go.Figure()
-        plan.add_trace(go.Scatter(x=east_p, y=north_p, mode="lines", name="Plan"))
-        plan.update_layout(title="Plan: East vs North", xaxis_title="East (ft)", yaxis_title="North (ft)")
+        plan.add_trace(go.Scatter(x=east, y=north, mode="lines", name="Plan"))
+        plan.update_layout(title="Plan", xaxis_title="East (ft)", yaxis_title="North (ft)")
 
         colA, colB = st.columns([2,1])
         with colA: st.plotly_chart(fig3d, use_container_width=True)
@@ -446,45 +463,7 @@ with tab1:
             st.plotly_chart(prof, use_container_width=True)
             st.plotly_chart(plan, use_container_width=True)
 
-        # --- Wellbore schematic (rectangles by OD, height to shoe TVD) ---
-        # X-units are feet; convert OD inches → ft (OD/12). Not to scale laterally; TVD true vertically.
-        figsch = go.Figure()
-        max_od_in = 0.0
-        for j, row in enumerate(casing_rows):
-            if row["shoe_md"] <= 0: continue
-            tv_shoe = interp_tvd_at_md(md, tvd, row["shoe_md"])
-            od_in = float(row["od"].replace("-"," ").split()[0]) if False else None  # not reliable parsing
-            # parse nominal OD inches from label like "9-5/8"
-            od_label = row["od"]
-            # convert "9-5/8" → 9 + 5/8
-            parts = od_label.split("-")
-            if len(parts) == 2:
-                whole = int(parts[0])
-                frac = parts[1]
-                num, den = frac.split("/")
-                od_in = whole + float(num)/float(den)
-            else:
-                od_in = float(od_label)  # if already plain
-            max_od_in = max(max_od_in, od_in)
-            half_ft = (od_in / 12.0) / 2.0
-            # add rectangle centered at x=0 from TVD=0 to shoe TVD
-            figsch.add_shape(type="rect",
-                             x0=-half_ft, x1=half_ft, y0=0.0, y1=tv_shoe,
-                             line=dict(width=1), fillcolor=f"rgba({50+40*j},120,200,0.35)")
-            # annotate
-            figsch.add_annotation(x=half_ft*1.2, y=tv_shoe*0.5,
-                                  text=f"{row['od']} {row['ppf']}# {row['grade']}\nID {row['id']:.3f} in",
-                                  showarrow=False, align="left", font=dict(size=11))
-
-        figsch.update_yaxes(autorange="reversed", title="TVD (ft)")
-        figsch.update_xaxes(title="(schematic width ~ OD/12 ft)")
-        xr = (max_od_in/12.0) if max_od_in>0 else 1.0
-        figsch.update_layout(title="Wellbore Schematic (not to horizontal scale)",
-                             xaxis=dict(range=[-xr, xr]),
-                             margin=dict(l=20,r=20,t=40,b=20), height=560)
-        st.plotly_chart(figsch, use_container_width=True)
-
-        # --- Survey table + CSV ---
+        # Survey table + CSV
         rows = [{"MD (ft)": md[i], "Inc (deg)": inc[i], "Az (deg)": az[i],
                  "TVD (ft)": tvd[i], "North (ft)": north[i], "East (ft)": east[i],
                  "DLS (deg/100 ft)": dls[i]} for i in range(len(md))]
@@ -497,17 +476,18 @@ with tab1:
                            file_name="trajectory.csv", mime="text/csv")
 
         st.markdown("---")
-        st.subheader("Minimum Curvature — equations (per course length Δs = 1 ft)")
+        st.subheader("Minimum Curvature — key equations")
         st.latex(r"\cos\Delta\sigma=\cos\theta_1\cos\theta_2+\sin\theta_1\sin\theta_2\cos(\phi_2-\phi_1)")
         st.latex(r"\mathrm{RF}=\frac{2}{\Delta\sigma}\tan\left(\frac{\Delta\sigma}{2}\right)")
         st.latex(r"\Delta N=\frac{\Delta s}{2}\left(\sin\theta_1\cos\phi_1+\sin\theta_2\cos\phi_2\right)\mathrm{RF}")
         st.latex(r"\Delta E=\frac{\Delta s}{2}\left(\sin\theta_1\sin\phi_1+\sin\theta_2\sin\phi_2\right)\mathrm{RF}")
         st.latex(r"\Delta \mathrm{TVD}=\frac{\Delta s}{2}\left(\cos\theta_1+\cos\theta_2\right)\mathrm{RF}")
-        st.caption("Dogleg Severity (DLS) is reported in deg/100 ft of course length.")
+        st.caption("DLS is reported in deg/100 ft of course length (Δs).")
 
 # -------------------- Tab 2 --------------------
 with tab2:
-    st.subheader("Soft-string Torque & Drag — cased vs open-hole split from casing program")
+    st.subheader("Soft-string Torque & Drag — Johancsik")
+
     colA, colB = st.columns(2)
     with colA:
         mw_ppg = st.number_input("Mud weight (ppg)", min_value=6.0, max_value=20.0, value=10.0, step=0.1)
@@ -546,8 +526,7 @@ with tab2:
             st.error("No trajectory found. Please generate in Tab 1 first.")
         else:
             md, inc, az, dls, tvd, north, east = st.session_state["last_traj"]
-            casing_prog = st.session_state.get("casing_program", [])
-            shoes = [row["shoe_md"] for row in casing_prog if row["shoe_md"] > 0]
+            shoes = [row["shoe_md"] for row in st.session_state.get("casing_program", []) if row["shoe_md"] > 0]
 
             out = solve_torque_drag(
                 md, inc, dls,
@@ -602,10 +581,11 @@ with tab2:
                 "- $\\sigma_{ax}=+1$ pickup (POOH), $-1$ slack-off (RIH). On-bottom uses WOB and bit torque."
             )
 
-# Footer references
+# Footer references (citations appear in the app page)
 st.markdown("---")
 st.caption(
-    "Casing options based on World Oil Casing Reference Tables and common API 5CT vendor charts; "
-    "e.g., 7\" 26# ID 6.276 in. Minimum Curvature and DLS/100 ft per directional survey standards; "
-    "buoyancy factor BF = (65.5 − MW) / 65.5."
+    "Minimum Curvature equations & RF (ratio factor) per standard directional-survey references; "
+    "Johancsik soft-string model assumes sliding friction with normal force from buoyed weight and tension-through-curvature; "
+    "Buoyancy factor BF = (65.5 − MW)/65.5; API RP 7G for combined tension–torque guidance; "
+    "Streamlit st.rerun() is the supported rerun API."
 )

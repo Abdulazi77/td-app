@@ -15,23 +15,41 @@ st.set_page_config(page_title="Well Trajectory Builder (J, S, Horizontal)", layo
 
 st.title("Well Trajectory Builder — J, S, Horizontal")
 
-# Load standard options
-with open("standard_options.json", "r") as f:
-    OPT = json.load(f)
+# Load standard options (fallback if JSON is missing)
+try:
+    import json
+    with open("standard_options.json", "r") as f:
+        OPT = json.load(f)
+except Exception:
+    OPT = {
+        "units": ["field (ft, deg)"],
+        "well_types": ["Build & Hold", "Build & Hold & Drop", "Horizontal (Continuous Build + Lateral)"],
+        "build_rates_deg_per_100ft": [0.5,1,1.5,2,3,4,6,8,10],
+        "drop_rates_deg_per_100ft": [0.5,1,1.5,2,3,4,6,8,10],
+        "course_lengths_ft": [10,20,30,50,100],
+        "quick_azimuths": [
+            {"label":"North (0)","deg":0},
+            {"label":"East (90)","deg":90},
+            {"label":"South (180)","deg":180},
+            {"label":"West (270)","deg":270}
+        ]
+    }
 
-col0, col1, col2 = st.columns([1,1,1])
-with col0:
+colA, colB = st.columns(2)
+with colA:
     units = st.selectbox("Units", OPT["units"], index=0)
-    metric = (units.startswith("metric"))
-with col1:
-    ds_ft = st.selectbox("Course length (step, ft)", OPT["course_lengths_ft"], index=2)
-with col2:
-    az_quick = st.selectbox("Quick azimuth pick", [x["label"] for x in OPT["quick_azimuths"]], index=0)
-    azimuth_deg = [x["deg"] for x in OPT["quick_azimuths"]][st.session_state[st.widget_id(az_quick)] if hasattr(st, "widget_id") else OPT["quick_azimuths"].index({"label":az_quick,"deg":0})] if False else [x["deg"] for x in OPT["quick_azimuths"]][0]
-# Simpler: let user override azimuth
-azimuth_deg = st.number_input("Azimuth (deg from North, clockwise)", min_value=0.0, max_value=360.0, value=float(azimuth_deg), step=1.0)
+with colB:
+    ds_ft = st.selectbox("Course length (ft)", OPT["course_lengths_ft"], index=2)
 
-profile = st.selectbox("Well profile", OPT["well_types"], index=0)
+# Simple, reliable quick-azimuth selection
+label_list = [x["label"] for x in OPT["quick_azimuths"]]
+label = st.selectbox("Quick azimuth", label_list, index=0)
+label_to_deg = {x["label"]: x["deg"] for x in OPT["quick_azimuths"]}
+default_deg = float(label_to_deg[label])
+azimuth_deg = st.number_input("Azimuth (deg from North, clockwise)",
+                              min_value=0.0, max_value=360.0,
+                              value=default_deg, step=1.0)
+
 
 # Common inputs
 kop_md = st.number_input("KOP MD (ft)", min_value=0.0, value=1000.0, step=50.0)

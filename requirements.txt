@@ -1,7 +1,4 @@
-streamlit==1.38.0
-plotly>=5.22
-pandas>=2.2
-numpy>=1.26
-xlsxwriter
-torque-drag>=0.0.7
-well-profile>=0.3.10
+streamlit==1.39.0
+pandas==2.2.2
+numpy==1.26.4
+plotly==5.24.1

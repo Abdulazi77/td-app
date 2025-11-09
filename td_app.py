@@ -1,15 +1,7 @@
-
----
-
-# 3) `td_app.py`  (full app)
-
-> Paste this whole file as `td_app.py`. If Streamlit Cloud still spins, set **Main file path** to `td_app.py` in **Manage app → Settings** or re-deploy the app with this file as the entrypoint. :contentReference[oaicite:4]{index=4}
-
-```python
-# Torque & Drag — Soft-String App (Johancsik + torque_drag)
-# Sources: torque_drag.calc API (SPE-11380-PA model) and well_profile trajectory loader.
-# torque_drag docs: https://torque-drag.readthedocs.io/en/latest/calculations.html
-# well_profile load CSV/DataFrame: https://well-profile.readthedocs.io/en/latest/load_profile.html
+# Torque & Drag — Soft-String (Johancsik) with torque_drag cross-check
+# Docs: torque_drag.calc expects a well_profile trajectory (SPE-11380-PA basis)
+# https://torque-drag.readthedocs.io/en/latest/calculations.html
+# https://well-profile.readthedocs.io/en/latest/create_profile.html
 
 import streamlit as st
 st.set_page_config(page_title="Torque & Drag — Soft-String", layout="wide")
@@ -19,12 +11,10 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 
-# External engines
-import torque_drag as td   # pip: torque-drag
-import well_profile as wp  # pip: well-profile
+import torque_drag as td          # pip install torque-drag
+import well_profile as wp         # pip install well-profile
 
-# ------------------------ constants & helpers ------------------------
-
+# ---------------- constants & unit helpers ----------------
 LBF_PER_kN = 224.8089431
 KFTLBF_PER_kN_M = 737.5621493
 kN_PER_KLBF = 4.4482216153
@@ -32,20 +22,17 @@ kN_M_PER_KFTLBF = 1.3558179483
 STEEL_DENS_LB_PER_IN3 = 0.283  # ~7.85 g/cc
 
 def buoyancy_factor_from_mw_ppg(mw_ppg: float) -> float:
-    # BF = (65.5 - MW)/65.5  (English ppg)
+    # BF = (65.5 - MW) / 65.5 (English ppg)
     return (65.5 - mw_ppg) / 65.5
 
 def metal_area_in2(od_in, id_in) -> float:
     return np.pi/4.0 * (od_in**2 - id_in**2)
 
 def w_air_lbf_per_ft(od_in, id_in) -> float:
-    # weight/ft = volume_per_ft * density
-    # volume_per_ft [in^3/ft] = area_in2 * 12
     vol_in3_per_ft = metal_area_in2(od_in, id_in) * 12.0
     return vol_in3_per_ft * STEEL_DENS_LB_PER_IN3
 
 def resample_survey(md_ft, inc_deg, azi_deg, step_ft=1.0):
-    """Resample survey to ~1-ft increments for smoother soft-string integration."""
     md_min, md_max = float(md_ft.min()), float(md_ft.max())
     grid = np.arange(md_min, md_max + step_ft, step_ft)
     inc_i = np.interp(grid, md_ft, inc_deg)
@@ -53,89 +40,69 @@ def resample_survey(md_ft, inc_deg, azi_deg, step_ft=1.0):
     return grid, inc_i, azi_i
 
 def dogleg_and_kappa(md, inc_deg, azi_deg):
-    """Compute dogleg angle (rad) and curvature kappa (rad/ft) between points."""
     inc = np.radians(inc_deg)
     azi = np.radians(azi_deg)
     dmd = np.diff(md)
-    # Minimum curvature dogleg angle
     cos_dog = np.sin(inc[:-1])*np.sin(inc[1:])*np.cos(azi[1:]-azi[:-1]) + np.cos(inc[:-1])*np.cos(inc[1:])
     cos_dog = np.clip(cos_dog, -1.0, 1.0)
     dog = np.arccos(cos_dog)  # radians
-    with np.errstate(divide='ignore', invalid='ignore'):
-        kappa = np.zeros_like(dog)
-        kappa[dmd_nonzero := dmd > 0] = dog[dmd_nonzero] / dmd[dmd_nonzero]
+    kappa = np.zeros_like(dog)
+    nz = dmd > 0
+    kappa[nz] = dog[nz] / dmd[nz]  # rad/ft
     return dog, kappa, dmd
 
 def build_mu_profile(md_grid, mu_cased, mu_open, shoe_md_ft):
-    mu = np.where(md_grid <= shoe_md_ft, mu_cased, mu_open)
-    return mu
+    return np.where(md_grid <= shoe_md_ft, mu_cased, mu_open)
 
 def eff_radius_ft(casing_id_in, pipe_od_in):
-    # approximate wall contact radius for annular friction torque lever arm
     clr_in = max(casing_id_in - pipe_od_in, 0.0)
     return 0.5 * clr_in / 12.0
 
 def map_case(mode_str):
-    # UI -> torque_drag
     return {"PU": "hoisting", "SL": "lowering", "ROB": "static"}[mode_str]
 
-# ------------------------ internal soft-string step solver ------------------------
-
+# ---------------- internal Johancsik soft-string solver ----------------
 def soft_string_iterate(md_grid, inc_deg, azi_deg, pipe_od_in, pipe_id_in,
                         casing_id_in, bf, mu_prof, mode, wob_klbf, tbit_kftlbf):
     """
-    Johancsik soft-string per-step integration bottom->top:
-      N = Wb*sin(theta) + T*kappa
-      dF = (sgn*Wb*cos(theta) + mu*N)*ds,   sgn=+1(PU), -1(SL), 0(ROB for friction term)
-      dT = mu*N*r_eff*ds
-    Returns DataFrame 'trace' with per-row values and summary dict.
+    N = Wb*sin(theta) + T*kappa
+    dF = (sgn*Wb*cos(theta) + mu*N)*ds,  sgn=+1 (PU), -1 (SL), ROB => friction term off
+    dT = mu*N*r_eff*ds
+    Integrate bottom -> top. Returns per-step trace and surface summary.
     """
-
-    # prepare arrays
     dog, kappa, dmd = dogleg_and_kappa(md_grid, inc_deg, azi_deg)
     theta = np.radians(inc_deg)
-    # weight per ft (air) & buoyed
+
     w_air = w_air_lbf_per_ft(pipe_od_in, pipe_id_in)
     w_b = w_air * bf
     r_eff_ft = eff_radius_ft(casing_id_in, pipe_od_in)
 
-    # boundary at bit (last node)
     wob_lbf = wob_klbf * 1000.0
     tbit_lbf_ft = tbit_kftlbf * 1000.0
-    if mode == "ROB":  # rotating on bottom
-        T_prev = -wob_lbf  # axial sign convention: compressive at bit
+    if mode == "ROB":
+        T_prev = -wob_lbf  # compressive at bit
         M_prev = tbit_lbf_ft
         friction_term_on = False
-        sgn = +1.0  # only weight term (axial) sign doesn't matter for ROB frictionless axial; keep +1 for clarity
-    elif mode == "PU":
-        T_prev = 0.0
-        M_prev = 0.0
-        friction_term_on = True
         sgn = +1.0
+    elif mode == "PU":
+        T_prev = 0.0; M_prev = 0.0; friction_term_on = True; sgn = +1.0
     elif mode == "SL":
-        T_prev = 0.0
-        M_prev = 0.0
-        friction_term_on = True
-        sgn = -1.0
+        T_prev = 0.0; M_prev = 0.0; friction_term_on = True; sgn = -1.0
     else:
-        raise ValueError("mode must be 'PU','SL','ROB'")
+        raise ValueError("mode must be PU/SL/ROB")
 
     rows = []
-    # iterate bottom (end) -> top (start)
     for i in range(len(md_grid)-1, 0, -1):
         ds = md_grid[i] - md_grid[i-1]
-        th = float((theta[i] + theta[i-1]) / 2.0)          # avg inclination
+        th = float((theta[i] + theta[i-1]) / 2.0)
         kap = float(kappa[i-1])
         mu = float((mu_prof[i] + mu_prof[i-1]) / 2.0)
 
-        # side/normal force per unit length
         N_per_ft = w_b*np.sin(th) + T_prev*kap
-        # axial increment per unit length
         dF_per_ft = sgn*w_b*np.cos(th) + (mu*N_per_ft if friction_term_on else 0.0)
         dF = dF_per_ft * ds
         F_next = T_prev + dF
 
-        # torque increment
         dT_per_ft = (mu*N_per_ft*r_eff_ft if friction_term_on else 0.0)
         dT = dT_per_ft * ds
         T_next = M_prev + dT
@@ -150,23 +117,17 @@ def soft_string_iterate(md_grid, inc_deg, azi_deg, pipe_od_in, pipe_id_in,
             "Wb_lbf_per_ft": w_b,
             "N_lbf_per_ft": N_per_ft,
             "dF_lbf": dF,
-            "F_next_lbf": F_next,  # axial at this node going up
+            "F_next_lbf": F_next,
             "dT_lbf_ft": dT,
             "T_next_lbf_ft": T_next
         })
-
-        # advance
         T_prev = F_next
         M_prev = T_next
 
-    trace = pd.DataFrame(rows[::-1])  # reorder top->bottom
-    # surface values are last updated (at top)
-    hookload_surf_lbf = T_prev
-    torque_surf_lbf_ft = M_prev
-
+    trace = pd.DataFrame(rows[::-1])  # top->bottom
     summary = {
-        "hookload_lbf": hookload_surf_lbf,
-        "torque_lbf_ft": torque_surf_lbf_ft,
+        "hookload_lbf": T_prev,
+        "torque_lbf_ft": M_prev,
         "w_air_lbf_per_ft": w_air,
         "w_buoy_lbf_per_ft": w_b,
         "bf": bf,
@@ -174,56 +135,49 @@ def soft_string_iterate(md_grid, inc_deg, azi_deg, pipe_od_in, pipe_id_in,
     }
     return trace, summary
 
-# ------------------------ UI ------------------------
-
+# ---------------- UI ----------------
 st.title("Torque & Drag — Soft-String (Johancsik)")
 
 with st.sidebar:
     st.header("Report Header")
-    team_names = st.text_input("Team names (comma-separated)", "")
-    methodology = st.text_area("Methodology", "Soft-string model (Johancsik SPE-11380) + torque_drag cross-check.")
-    assumptions = st.text_area("Assumptions", "Pipe fully fluid-filled; constant μ per interval; no buckling.")
-    insights_user = st.text_area("Your insights", "Drag ↑ with inclination and μ; torque lever arm set by annular clearance.")
+    team_names = st.text_input("Team names", "")
+    methodology = st.text_area("Methodology", "Soft-string (Johancsik SPE-11380) + torque_drag cross-check.")
+    assumptions = st.text_area("Assumptions", "Constant μ per interval; pipe fluid-filled; no buckling.")
+    insights_user = st.text_area("Your insights", "Drag increases with inclination & μ; torque lever arm set by clearance.")
 
     st.header("1) Trajectory")
-    src = st.radio("Source", ["Upload CSV", "Synthetic"], horizontal=True)
+    src = st.radio("Source", ["Upload CSV", "Synthetic (J/S/H1)"], horizontal=True)
     survey_df = None
     if src == "Upload CSV":
-        st.caption("CSV columns (headers flexible): md_ft, inc_deg, azi_deg")
+        st.caption("CSV headers accepted: md_ft, inc_deg, azi_deg (aliases md/inc/azi).")
         file = st.file_uploader("Upload survey CSV", type=["csv"])
         if file:
             df = pd.read_csv(file)
-            # normalize headers
-            rename_map = {c: c.strip().lower() for c in df.columns}
-            df.columns = rename_map.values()
-            # common aliases
+            cols = {c: c.strip().lower() for c in df.columns}
+            df.columns = cols.values()
             alias = {}
             if "md_ft" not in df.columns and "md" in df.columns: alias["md"] = "md_ft"
             if "inc_deg" not in df.columns and "inc" in df.columns: alias["inc"] = "inc_deg"
             if "azi_deg" not in df.columns and "azi" in df.columns: alias["azi"] = "azi_deg"
-            df = df.rename(columns=alias)
-            survey_df = df[["md_ft", "inc_deg", "azi_deg"]].copy()
+            survey_df = df.rename(columns=alias)[["md_ft","inc_deg","azi_deg"]].copy()
     else:
-        st.caption("Quick synthetic profile (well_profile.get)")
-        prof = st.selectbox("Type", ["J", "S", "H1 (Horizontal single curve)"], index=0)
-        mdt = st.number_input("Target MD (ft)", 1000.0, 30000.0, 10000.0, step=500.0)
-        build_angle = st.number_input("Build angle (°)", 1.0, 90.0, 30.0, step=1.0)
-        kop = st.number_input("KOP (ft)", 0.0, 20000.0, 2000.0, step=100.0)
-        eob = st.number_input("EOB (ft)", 0.0, 30000.0, 4000.0, step=100.0)
-        sod = st.number_input("SOD (ft)", 0.0, 30000.0, 0.0, step=100.0, help="For S-type/H2 only")
-        eod = st.number_input("EOD (ft)", 0.0, 30000.0, 0.0, step=100.0, help="For S-type/H2 only")
-        points = st.slider("Points (resolution)", 100, 5000, 1200, 100)
-        # Create via well_profile.get, then extract md/inc/azi from returned object
-        wtmp = wp.get(mdt, profile=('H1' if prof.startswith('H1') else prof),
-                      build_angle=build_angle, kop=kop, eob=eob, sod=sod, eod=eod,
-                      points=points, set_start={'north':0, 'east':0})
-        # The well object has a dataframe property
-        wdf = pd.DataFrame({
-            "md_ft": wtmp.trajectory['md'], 
+        st.caption("Synthetic via well_profile.get (J / S / H1). Provide KOP/EOB/SOD/EOD as needed.")
+        prof = st.selectbox("Profile", ["J", "S", "H1"], index=0)
+        mdt = st.number_input("Target MD (ft)", 1000.0, 40000.0, 12000.0, step=500.0)
+        build_angle = st.number_input("Build angle (deg)", 1.0, 90.0, 30.0, step=1.0)
+        kop = st.number_input("KOP (ft)", 0.0, 30000.0, 2000.0, step=100.0)
+        eob = st.number_input("EOB (ft)", 0.0, 40000.0, 4000.0, step=100.0)
+        sod = st.number_input("SOD (ft)", 0.0, 40000.0, 0.0, step=100.0, help="For S/H2 only")
+        eod = st.number_input("EOD (ft)", 0.0, 40000.0, 0.0, step=100.0, help="For S/H2 only")
+        points = st.slider("Resolution (points)", 200, 6000, 1400, 100)
+        wtmp = wp.get(mdt, profile=prof, build_angle=build_angle,
+                      kop=kop, eob=eob, sod=sod, eod=eod,
+                      points=points, set_start={'north':0,'east':0})
+        survey_df = pd.DataFrame({
+            "md_ft": wtmp.trajectory['md'],
             "inc_deg": np.degrees(wtmp.trajectory['inc']),
             "azi_deg": np.degrees(wtmp.trajectory['azi'])
         })
-        survey_df = wdf
 
     st.header("2) Pipe / Casing / Fluid")
     pipe_od = st.selectbox("Pipe OD (in)", [2.375, 2.875, 3.5, 4.0, 4.5, 5.0, 5.5, 6.625], index=4)
@@ -231,16 +185,15 @@ with st.sidebar:
     casing_od = st.selectbox("Casing/Hole OD (in)", [7.0, 8.5, 9.625, 12.25, 16.0], index=1)
     casing_id = st.number_input("Casing/Hole ID (in)", 3.0, float(casing_od)-0.05, float(casing_od)-0.5, step=0.01, format="%.3f")
     shoe_md_ft = st.number_input("Casing shoe depth (ft)", 0.0, 40000.0, 4000.0, step=100.0)
-
     mud_ppg = st.number_input("Mud weight (ppg)", 6.0, 20.0, 10.0, step=0.1)
     steel_sg = st.number_input("Steel SG", 7.6, 8.2, 7.85, step=0.01)
 
     st.header("3) Friction & Loads")
-    mu_cased = st.number_input("μ in cased hole", 0.05, 0.80, 0.25, step=0.01)
-    mu_open = st.number_input("μ in open hole", 0.05, 0.80, 0.30, step=0.01)
+    mu_cased = st.number_input("μ in cased", 0.05, 0.80, 0.25, step=0.01)
+    mu_open = st.number_input("μ in open", 0.05, 0.80, 0.30, step=0.01)
     overlay_on = st.checkbox("Overlay extra μ curves (comma list)", value=True)
     mu_overlay_str = st.text_input("Extra μ values", "0.20,0.30,0.40", disabled=not overlay_on)
-    mode = st.selectbox("Case", ["PU", "SL", "ROB"])  # hoisting / lowering / static
+    mode = st.selectbox("Case", ["PU","SL","ROB"])
     wob_klbf = st.number_input("WOB at bit (klbf)", 0.0, 300.0, 40.0, step=1.0)
     tbit_kftlbf = st.number_input("Bit torque (kft-lbf)", 0.0, 100.0, 0.0, step=0.5)
 
@@ -250,36 +203,37 @@ with st.sidebar:
     excel_export = st.checkbox("Export Excel workbook", value=True)
     run_btn = st.button("Run model")
 
-# ------------------------ main run ------------------------
-
+# ---------------- main run ----------------
 if run_btn:
     if survey_df is None or survey_df.empty:
         st.error("No survey data. Upload a CSV or generate a synthetic path.")
         st.stop()
 
-    # Load trajectory into well_profile (units: English/feet)
+    # well_profile: load the trajectory in English units
     well = wp.load(survey_df.rename(columns={"md_ft":"md","inc_deg":"inclination","azi_deg":"azimuth"}),
                    set_info={'units':'english'}, set_start={'north':0,'east':0})
-    # For plotting 3D, generate TVD/NE with our resample
+
+    # 1-ft resample for step integration and 3D plotting
     md_grid, inc_i, azi_i = resample_survey(survey_df["md_ft"].values,
                                             survey_df["inc_deg"].values,
                                             survey_df["azi_deg"].values, step_ft=1.0)
-    # Friction profile by interval
+
     bf = buoyancy_factor_from_mw_ppg(mud_ppg)
     mu_prof = build_mu_profile(md_grid, mu_cased, mu_open, shoe_md_ft)
 
-    # ----- internal soft-string (equations & numbers) -----
+    # ----- internal Johancsik solver (equations & numbers) -----
     trace, summary = soft_string_iterate(md_grid, inc_i, azi_i,
                                          pipe_od, pipe_id, casing_id,
                                          bf, mu_prof, mode, wob_klbf, tbit_kftlbf)
 
-    # ----- torque_drag engine (cross-check & overlays) -----
-    dims = {'pipe': {'od': float(pipe_od), 'id': float(pipe_id), 'shoe': float(shoe_md_ft)},
+    # ----- torque_drag cross-check & optional μ overlays -----
+    dims = {'pipe': {'od': float(pipe_od), 'id': float(pipe_id),
+                     'length': float(survey_df["md_ft"].max()), 'shoe': float(shoe_md_ft)},
             'odAnn': float(casing_od)}
-    dens = {'rhof': float(mud_ppg/8.33), 'rhod': float(steel_sg)}  # SG
+    dens = {'rhof': float(mud_ppg/8.33), 'rhod': float(steel_sg)}  # SG-like inputs
     td_case = map_case(mode)
 
-    def run_td(mu_val):
+    def run_td(mu_val: float) -> pd.DataFrame:
         res = td.calc(well.trajectory, dims, densities=dens,
                       case=td_case, fric=float(mu_val),
                       wob=wob_klbf * kN_PER_KLBF,
@@ -287,8 +241,6 @@ if run_btn:
                       torque_calc=True)
         force_kN = res.force[td_case]
         torque_kN_m = res.torque[td_case]
-        # build a DataFrame vs md (align lengths with md_grid if possible)
-        # use simple index for md; engines typically output per-point arrays.
         md_for_td = np.linspace(md_grid.min(), md_grid.max(), num=len(force_kN))
         return pd.DataFrame({
             "md_ft": md_for_td,
@@ -300,15 +252,13 @@ if run_btn:
     if overlay_on and mu_overlay_str.strip():
         overlay_mus = [float(x) for x in mu_overlay_str.split(",") if x.strip()]
 
-    td_curves = {"base": run_td(mu_open)}  # base uses open-hole μ nominal (visual)
+    td_curves = {"base μ(open)": run_td(mu_open)}
     for mu_extra in overlay_mus:
         td_curves[f"μ={mu_extra:.2f}"] = run_td(mu_extra)
 
-    # -------------------- PLOTS --------------------
-
-    col1, col2 = st.columns(2)
-
-    with col1:
+    # ---------------- plots ----------------
+    c1, c2 = st.columns(2)
+    with c1:
         figF = go.Figure()
         figF.add_trace(go.Scatter(x=trace["md_to_ft"], y=trace["F_next_lbf"],
                                   name="Internal model (axial)", mode="lines"))
@@ -318,8 +268,7 @@ if run_btn:
         figF.update_layout(title="Hookload / Axial vs MD",
                            xaxis_title="MD (ft)", yaxis_title="Force (lbf)")
         st.plotly_chart(figF, use_container_width=True)
-
-    with col2:
+    with c2:
         figT = go.Figure()
         figT.add_trace(go.Scatter(x=trace["md_to_ft"], y=trace["T_next_lbf_ft"],
                                   name="Internal model (torque)", mode="lines"))
@@ -330,54 +279,49 @@ if run_btn:
                            xaxis_title="MD (ft)", yaxis_title="Torque (lbf·ft)")
         st.plotly_chart(figT, use_container_width=True)
 
-    # 3D well path (simple minimum-curvature forward; uses resampled grid)
-    # Compute incremental NE/TVD
-    inc_rad = np.radians(inc_i)
-    azi_rad = np.radians(azi_i)
+    # 3D well path (approx MC forward)
+    inc_rad = np.radians(inc_i); azi_rad = np.radians(azi_i)
     dmd = np.diff(md_grid, prepend=md_grid[0])
     tvd = np.cumsum(dmd * np.cos(inc_rad))
     north = np.cumsum(dmd * np.sin(inc_rad) * np.cos(azi_rad))
-    east = np.cumsum(dmd * np.sin(inc_rad) * np.sin(azi_rad))
-
-    fig3d = go.Figure(data=[go.Scatter3d(
-        x=east, y=north, z=-tvd, mode="lines", name="Well path")])
-    fig3d.update_layout(title="3D Well Path", scene=dict(
-        xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)"))
+    east  = np.cumsum(dmd * np.sin(inc_rad) * np.sin(azi_rad))
+    fig3d = go.Figure(data=[go.Scatter3d(x=east, y=north, z=-tvd, mode="lines", name="Well path")])
+    fig3d.update_layout(title="3D Well Path",
+                        scene=dict(xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)"))
     st.plotly_chart(fig3d, use_container_width=True)
 
-    # -------------------- TABLES --------------------
-    st.subheader("Iteration trace (selected rows)")
+    # ---------------- tables ----------------
     if show_trace:
-        st.dataframe(trace.iloc[::max(1, len(trace)//30)].round(5), use_container_width=True)
+        st.subheader("Iteration trace (sampled rows)")
+        st.dataframe(trace.iloc[::max(1, len(trace)//30)].round(6), use_container_width=True)
 
-    # -------------------- REPORT --------------------
+    # ---------------- report ----------------
     report = []
-    report.append("# Torque & Drag — Soft-String Report\n")
-    report.append(f"**Team**: {team_names}\n")
-    report.append("## Methodology & Sources\n")
-    report.append("- Soft-string model per Johancsik SPE-11380; friction force = μ×(Wb·sinθ + T·κ).\n")
-    report.append("- Well path loaded with `well_profile.load` (English units), T&D cross-check with `torque_drag.calc`.\n")
-    report.append("## Inputs (key)\n")
-    report.append(f"- Pipe: OD {pipe_od:.3f} in, ID {pipe_id:.3f} in; Casing/Hole ID {casing_id:.3f} in (OD {casing_od:.3f} in), Shoe {shoe_md_ft:.1f} ft\n")
-    report.append(f"- Mud {mud_ppg:.2f} ppg → BF {bf:.4f}; μ(cased/open) = {mu_cased:.2f}/{mu_open:.2f}\n")
-    report.append(f"- Case {mode}; WOB {wob_klbf:.1f} klbf; Bit torque {tbit_kftlbf:.2f} kft-lbf\n")
-    report.append("## Core Equations\n")
-    report.append("Side force per ft: N = Wb·sinθ + T·κ\n")
-    report.append("Axial: F(i+1) = F(i) + [ sgn·Wb·cosθ + μ·N ]·Δs (sgn=+1 PU, −1 SL; ROB→friction term canceled)\n")
-    report.append("Torque: M(i+1) = M(i) + μ·N·r_eff·Δs, r_eff = (ID_casing − OD_pipe)/2\n")
-    report.append("## Results (internal model)\n")
-    report.append(f"- Surface hookload ≈ {summary['hookload_lbf']:.0f} lbf; Surface torque ≈ {summary['torque_lbf_ft']:.0f} lbf·ft\n")
+    report.append("# Torque & Drag — Soft-String Report")
+    report.append(f"Team: {team_names}")
+    report.append("## Methodology & Sources")
+    report.append("- Johancsik soft-string SPE-11380: friction force = μ×(Wb·sinθ + T·κ); integrated bit→surface.")
+    report.append("- Well path loaded via well_profile; torque_drag.calc used for cross-check.")
+    report.append("## Inputs")
+    report.append(f"Pipe OD/ID: {pipe_od:.3f}/{pipe_id:.3f} in; Casing ID/OD: {casing_id:.3f}/{casing_od:.3f} in; Shoe: {shoe_md_ft:.1f} ft")
+    report.append(f"Mud: {mud_ppg:.2f} ppg → BF={bf:.4f}; μ(cased/open)={mu_cased:.2f}/{mu_open:.2f}")
+    report.append(f"Case: {mode}; WOB={wob_klbf:.1f} klbf; Bit torque={tbit_kftlbf:.2f} kft-lbf")
+    report.append("## Core Equations")
+    report.append("N = Wb·sinθ + T·κ;  F(i+1)=F(i)+[sgn·Wb·cosθ + μ·N]·Δs;  M(i+1)=M(i)+μ·N·r_eff·Δs;  r_eff=(ID_casing−OD_pipe)/2")
+    report.append("## Results (internal solver)")
+    report.append(f"Surface hookload ≈ {summary['hookload_lbf']:.0f} lbf; Surface torque ≈ {summary['torque_lbf_ft']:.0f} lbf·ft")
     if show_deriv:
-        report.append("## Sample Derivations (first few steps)\n")
+        report.append("## Sample numeric derivations (first few steps)")
         for _, r in trace.head(6).iterrows():
             report.append(
-                f"MD {r['md_to_ft']:.1f}→{r['md_from_ft']:.1f}: θ={r['theta_deg']:.2f}°, κ={r['kappa_rad_per_ft']:.5e} rad/ft, "
-                f"N={r['N_lbf_per_ft']:.1f} lbf/ft, dF={r['dF_lbf']:.1f} lbf, F_next={r['F_next_lbf']:.1f} lbf; "
-                f"dT={r['dT_lbf_ft']:.1f} lbf·ft, T_next={r['T_next_lbf_ft']:.1f} lbf·ft")
+                f"MD {r['md_to_ft']:.1f}→{r['md_from_ft']:.1f}: θ={r['theta_deg']:.2f}°, κ={r['kappa_rad_per_ft']:.5e} rad/ft; "
+                f"N={r['N_lbf_per_ft']:.1f} lbf/ft; ΔF={r['dF_lbf']:.1f} lbf → F_next={r['F_next_lbf']:.1f} lbf; "
+                f"ΔM={r['dT_lbf_ft']:.1f} lbf·ft → M_next={r['T_next_lbf_ft']:.1f} lbf·ft"
+            )
     report_txt = "\n".join(report)
     st.download_button("Download report (txt)", data=report_txt, file_name="TD_Report.txt", mime="text/plain")
 
-    # -------------------- EXCEL EXPORT --------------------
+    # ---------------- Excel export ----------------
     if excel_export:
         with pd.ExcelWriter("TD_Output.xlsx", engine="xlsxwriter") as xw:
             survey_df.to_excel(xw, index=False, sheet_name="Inputs_Survey")
@@ -389,17 +333,13 @@ if run_btn:
                 "Case":[mode], "WOB_klbf":[wob_klbf], "Tbit_kftlbf":[tbit_kftlbf]
             }).to_excel(xw, index=False, sheet_name="Inputs_Strings")
             trace.round(6).to_excel(xw, index=False, sheet_name="Iteration_Trace")
-            # Curves
             internal = pd.DataFrame({"md_ft": trace["md_to_ft"],
                                      "F_lbf": trace["F_next_lbf"],
                                      "T_lbf_ft": trace["T_next_lbf_ft"]})
             internal.to_excel(xw, index=False, sheet_name="Curves_Internal")
             for name, dfc in td_curves.items():
-                dfc.to_excel(xw, index=False, sheet_name=f"Curves_{name[:25]}")
-            # Report
+                dfc.to_excel(xw, index=False, sheet_name=f"Curves_{name[:24]}")
             pd.DataFrame({"Report": report}).to_excel(xw, index=False, sheet_name="Report")
         with open("TD_Output.xlsx", "rb") as f:
-            st.download_button("Download Excel (XLSX)", f, file_name="TD_Output.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    # -------------------- FOOTER --------------------
-    st.info("Engine check: torque_drag calc signature and usage per docs (SPE-11380-PA). Well path loading per well_profile docs.")
+            st.download_button("Download Excel (XLSX)", f, file_name="TD_Output.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

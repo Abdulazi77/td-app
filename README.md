@@ -1,5 +1,27 @@
-# Soft-String Torque & Drag (Johancsik) — 1-ft Steps
+# Torque & Drag — Soft-String Model (PE GN 517 Project)
 
-Upload a survey CSV with columns: `md_ft, inc_deg, azi_deg` **or** choose a synthetic well.
-Inputs: pipe OD/ID, annulus OD, mud (ppg), steel SG, friction μ, WOB/bit torque.
-Outputs: TVD vs VS, Hookload vs MD, Torque vs MD, iteration trace, optional μ-calibration.
+This app computes pickup, slack-off, and rotating torque/drag along a wellbore
+using the **Johancsik soft-string** formulation (SPE-11380 PA) and **API RP 7G**
+combined tension-torque limits.  
+It integrates the open-source [torque_drag](https://github.com/pro-well-plan/torque_drag)
+package with a Streamlit front-end.
+
+## Inputs
+- Directional survey (MD ft, Inc °, Az °)
+- Drillstring OD/ID (in), length (ft)
+- Casing OD/ID (in)
+- Mud weight (ppg)
+- Friction factor μ (cased / open hole)
+- WOB (klbf), bit torque (kft-lbf)
+- Scenario (PU / SL / ROB)
+
+## Outputs
+- Hookload vs depth, Torque vs depth
+- 3-D well path
+- Per-foot iteration trace and derivation
+- Technical report (TXT) and Excel workbook (XLSX)
+
+## Run locally
+```bash
+pip install -r requirements.txt
+streamlit run td_app.py

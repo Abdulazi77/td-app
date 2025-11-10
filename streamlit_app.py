@@ -1,10 +1,9 @@
 # streamlit_app.py — PEGN517 Wellpath + Torque & Drag (Δs = 1 ft)
-# - Minimum Curvature (1 ft course length)
-# - Simple casing mode: deepest shoe MD + last casing ID + open-hole OD
-# - Optional detailed program: Surface casing / Liner / Open hole rows
-# - 3D trajectory colored by cased vs open-hole; line thickness scaled by size
-# - Soft-string Torque & Drag (Johancsik) with buoyancy and cased/open μ split
-# - Streamlit 1.3x+: uses st.rerun()
+# - Minimum Curvature trajectory (1 ft step)
+# - Simple casing mode: Shoe MD + (Nominal OD & lb/ft -> ID auto) + Open-hole diameter (standards-only dropdowns)
+# - Optional detailed program editor (Surface casing / Liner / Open hole)
+# - 3D schematic: cased (blue) vs open-hole (brown), line thickness ~ ID / hole OD
+# - Soft-string Torque & Drag (Johancsik) with buoyancy & cased/open μ split
 
 import math
 from typing import Tuple, List, Dict
@@ -16,9 +15,10 @@ st.set_page_config(page_title="Wellpath + Torque & Drag — PEGN517", layout="wi
 DEG2RAD = math.pi/180.0
 RAD2DEG = 180.0/math.pi
 
-# ------------------------------------
-# API-like mini library (OD -> ppf, ID)
-# ------------------------------------
+# -------------------------------------------
+# API-like casing mini library (OD -> ppf, ID)
+# (IDs/weights from open API 5CT tables)  # Sources: oilproduction.net, PandaPipe charts
+# -------------------------------------------
 CASING_DB: Dict[str, Dict[str, List[Dict[str, float]]]] = {
     "13-3/8": {
         "grades": ["J55","K55","N80","L80","P110"],
@@ -84,7 +84,17 @@ CASING_DB: Dict[str, Dict[str, List[Dict[str, float]]]] = {
     },
 }
 
-def parse_od_inch(label: str) -> float:
+# Common **hole diameters** (bit sizes) used in well design
+# Sources (examples): DrillingManual selection chart; “bit sizes vs casing” tables
+HOLE_SIZES = [
+    "36", "26", "24", "20",
+    "17-1/2", "16", "14-3/4", "12-1/4",
+    "10-5/8", "9-7/8", "8-3/4", "8-1/2",
+    "6-1/2", "6-1/8", "6", "5-7/8", "4-3/4"
+]
+
+def parse_inch_str(label: str) -> float:
+    """Parse sizes like '13-3/8' or '12-1/4' to float inches."""
     if "-" in label:
         whole, frac = label.split("-")
         num, den = frac.split("/")
@@ -101,8 +111,8 @@ def _rf(dogs_rad: float) -> float:
 
 def _mcm_step(md1, inc1_deg, az1_deg, md2, inc2_deg, az2_deg, n1, e1, tvd1):
     ds = md2 - md1
-    inc1 = inc1_deg*DEG2RAD; inc2 = inc2_deg*DEG2RAD
-    az1  = az1_deg*DEG2RAD;  az2  = az2_deg*DEG2RAD
+    inc1 = math.radians(inc1_deg); inc2 = math.radians(inc2_deg)
+    az1  = math.radians(az1_deg);  az2  = math.radians(az2_deg)
     cosd = (math.cos(inc1)*math.cos(inc2)
             + math.sin(inc1)*math.sin(inc2)*math.cos(az2-az1))
     cosd = max(-1.0, min(1.0, cosd))
@@ -112,7 +122,7 @@ def _mcm_step(md1, inc1_deg, az1_deg, md2, inc2_deg, az2_deg, n1, e1, tvd1):
     dE = 0.5*ds*(math.sin(inc1)*math.sin(az1) + math.sin(inc2)*math.sin(az2))*rf
     dT = 0.5*ds*(math.cos(inc1) + math.cos(inc2))*rf
     n2, e2, tvd2 = n1+dN, e1+dE, tvd1+dT
-    dls = 0.0 if ds <= 0 else dogs*RAD2DEG/ds*100.0
+    dls = 0.0 if ds <= 0 else math.degrees(dogs)/ds*100.0
     return n2, e2, tvd2, dls
 
 def mcm_positions(md, inc, az):
@@ -124,7 +134,7 @@ def mcm_positions(md, inc, az):
     return north, east, tvd, dls
 
 def _gen_md(target_md: float, ds: float = 1.0) -> List[float]:
-    """Fixed bug: always return a list (even if exact multiple)."""
+    """Always return a list (even if target_md is an exact multiple of ds)."""
     steps = int(max(0.0, target_md) // ds)
     md = [i*ds for i in range(steps + 1)]
     if md[-1] < target_md:
@@ -183,12 +193,12 @@ def synth_horizontal(kop_md, br, lat_len, target_md, az_deg):
 # Soft-string Torque & Drag (Johancsik method)
 # ============================================
 def buoyancy_factor_ppg(mw_ppg: float) -> float:
-    # BF = (65.5 - MW)/65.5
+    # BF = (65.5 - MW)/65.5   (steel ~ 65.5 ppg)
     BF = (65.5 - float(mw_ppg))/65.5
     return max(0.0, min(1.0, BF))
 
 def kappa_from_dls(dls_deg_100: float) -> float:
-    return (dls_deg_100*DEG2RAD)/100.0
+    return math.radians(dls_deg_100)/100.0
 
 def solve_torque_drag(md, inc_deg, dls_deg_100,
                       dc_len, dc_od, dc_id, dc_w,
@@ -231,7 +241,7 @@ def solve_torque_drag(md, inc_deg, dls_deg_100,
     # Integrate bit -> surface
     for i in range(n-1, 0, -1):
         md2, md1 = md[i], md[i-1]; ds = md2 - md1
-        theta = inc_deg[i]*DEG2RAD; kap = kappa[i]
+        theta = math.radians(inc_deg[i]); kap = kappa[i]
         w_air, od_in = comp_at_md(md2); w_b = w_air*BF; r_eff_ft = (od_in/2.0)/12.0
         mid_md = 0.5*(md1 + md2)
         in_cased = is_cased(mid_md)
@@ -271,7 +281,6 @@ def solve_torque_drag(md, inc_deg, dls_deg_100,
 # Interval helpers (detailed mode)
 # --------------------------------
 def intervals_from_program(rows, td) -> Tuple[List[Tuple[float,float]], List[Tuple[float,float]]]:
-    """Return (cased_intervals, openhole_intervals) as [(top, bot), ...] within [0, TD]."""
     cased, openh = [], []
     for r in rows:
         typ = r["type"]
@@ -320,16 +329,27 @@ with tab1:
     st.markdown("### Casing / Liner / Open-hole program (optional)")
     st.caption("Use **simple mode** for just deepest shoe & sizes — or build a detailed program. All calculations use Δs = 1 ft.")
 
-    # Simple mode toggle
-    use_simple = st.checkbox("Use simple inputs (deepest shoe + last casing ID + open-hole OD)", value=True)
+    # Simple mode (standards-only)
+    use_simple = st.checkbox("Use simple inputs (deepest shoe + last casing size + open-hole diameter)", value=True)
     if use_simple:
         s1, s2, s3 = st.columns(3)
         with s1:
             simple_shoe_md = st.number_input("Deepest shoe MD (ft)", 0.0, None, 3000.0, 50.0)
         with s2:
-            simple_last_csg_id = st.number_input("Last casing **ID** (in)", 0.0, 30.0, 12.115, 0.01)
+            last_od = st.selectbox("Last casing — Nominal OD", list(CASING_DB.keys()))
         with s3:
-            simple_oh_od = st.number_input("Open-hole **OD** (in)", 0.0, 30.0, 8.5, 0.01)
+            # Pick lb/ft option (ID auto-fills from DB)
+            opt = st.selectbox("Last casing — lb/ft (ID auto)", CASING_DB[last_od]["options"],
+                               format_func=lambda o: f"{o['ppf']:.2f} #  →  ID {o['id']:.3f} in")
+            simple_last_casing_id = opt["id"]
+
+        s4, s5 = st.columns(2)
+        with s4:
+            hole_sel = st.selectbox("Open-hole diameter (standards)", HOLE_SIZES, index=HOLE_SIZES.index("12-1/4") if "12-1/4" in HOLE_SIZES else 0)
+            simple_hole_od = parse_inch_str(hole_sel)
+        with s5:
+            st.write("")  # spacer
+            st.write(f"Selected open-hole OD = **{simple_hole_od:.3f} in**")
     else:
         # Detailed program editor
         if "prog_rows" not in st.session_state: st.session_state["prog_rows"] = 1
@@ -350,7 +370,7 @@ with tab1:
             od = c1.selectbox("", list(CASING_DB.keys()), key=f"od_{i}")
             opts = CASING_DB[od]["options"]
             sel_opt = c2.selectbox("", opts, key=f"ppf_{i}",
-                                   format_func=lambda o: f"{o['ppf']:.2f}".rstrip("0").rstrip("."))
+                                   format_func=lambda o: f"{o['ppf']:.2f} #  →  ID {o['id']:.3f} in")
             c3.text_input("", f"{sel_opt['id']:.3f}", key=f"id_{i}", disabled=True)
             grade = c4.selectbox("", CASING_DB[od]["grades"], key=f"gr_{i}")
             if typ == "Surface casing":
@@ -381,13 +401,16 @@ with tab1:
 
         north, east, tvd, dls = mcm_positions(md, inc, az)
         st.session_state["last_traj"] = (md, inc, az, dls, tvd, north, east)
-
         TD = md[-1]
+
         if use_simple:
             cased_intervals = [(0.0, min(simple_shoe_md, TD))]
             openhole_intervals = [(min(simple_shoe_md, TD), TD)]
-            st.session_state["cased_intervals"] = cased_intervals  # save for T&D tab
-            simple_sizes = {"casing_id_in": simple_last_csg_id, "openhole_od_in": simple_oh_od}
+            st.session_state["cased_intervals"] = cased_intervals
+            simple_sizes = {
+                "casing_id_in": simple_last_casing_id,
+                "openhole_od_in": simple_hole_od
+            }
         else:
             st.session_state["program"] = program
             cased_intervals, openhole_intervals = intervals_from_program(program, TD)
@@ -410,7 +433,7 @@ with tab1:
                 name = f"Cased: {int(top)}–{int(bot)} ft (ID {simple_sizes['casing_id_in']:.3f} in)"
             else:
                 any_csg = next((r for r in st.session_state.get("program", []) if r.get("od")), None)
-                od_in = parse_od_inch(any_csg["od"]) if any_csg else 9.625
+                od_in = parse_inch_str(any_csg["od"]) if any_csg else 9.625
                 width_px = max(2, int(2 + od_in/3.0))
                 name = f"Cased: {int(top)}–{int(bot)} ft"
             fig3d.add_trace(go.Scatter3d(
@@ -438,7 +461,7 @@ with tab1:
             legend=dict(itemsizing="constant"), margin=dict(l=0, r=0, t=40, b=0)
         )
 
-        # 2D profiles
+        # 2D plots
         prof = go.Figure(); prof.add_trace(go.Scatter(x=md, y=tvd, mode="lines", name="TVD vs MD"))
         prof.update_yaxes(autorange="reversed")
         prof.update_layout(title="Profile", xaxis_title="MD (ft)", yaxis_title="TVD (ft)")
@@ -500,8 +523,6 @@ with tab2:
             st.error("No trajectory found. Compute in Tab 1 first.")
         else:
             md, inc, az, dls, tvd, north, east = st.session_state["last_traj"]
-            TD = md[-1]
-            # Prefer intervals saved from simple/detailed mode in Tab 1
             cased_intervals = st.session_state.get("cased_intervals", [(0.0, 0.0)])
             out = solve_torque_drag(
                 md, inc, dls,
@@ -542,4 +563,7 @@ with tab2:
                                    file_name="td_iteration_trace.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("Δs = 1 ft; buoyancy applied to all component weights; cased vs open-hole friction split per depth.")
+st.caption(
+    "Standards-only dropdowns for casing ID (via Nominal OD + lb/ft) and open-hole diameter. "
+    "Buoyancy factor BF=(65.5−MW)/65.5 applied to component weights; Johancsik soft-string integration with cased vs open-hole friction."
+)

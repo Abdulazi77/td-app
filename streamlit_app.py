@@ -2,10 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
-One-tab app: survey → casing/open-hole → T&D. Now includes:
-- 2D Wellbore profile (TVD vs Vertical Section)
-- Drag profiles (Pickup/Slack-off/Rotating) with μ sweep overlays
+One-tab app: survey → casing/open-hole → T&D.
+Changes:
+- Removed "Drag Profiles — μ overlays" (three small plots).
+- 2D TVD–VS profile split by Shoe MD, colors match 3D (cased cyan, open-hole brown).
 """
+
 from __future__ import annotations
 
 import math
@@ -128,7 +130,7 @@ def soft_string_stepper(md, inc_deg, kappa_rad_per_ft, cased_mask,
     dT = np.zeros(nseg);  dM = np.zeros(nseg);  N_side = np.zeros(nseg)
 
     if scenario == "onbottom":
-        T[0] = -float(WOB_lbf)  # why: impose WOB at bit
+        T[0] = -float(WOB_lbf)  # impose WOB at bit
         M[0] = float(Mbit_ftlbf)
 
     sgn_ax = {"pickup": +1.0, "slackoff": -1.0}.get(scenario, 0.0)
@@ -167,6 +169,7 @@ def Fh_helical(Fs): return 1.6*Fs
 
 # ------------------------------ UI: one tab -----------------------------------
 (tab,) = st.tabs(["Wellpath + Torque & Drag (linked)"])
+
 with tab:
     # ---------- TRAJECTORY ----------
     st.subheader("Trajectory & 3D schematic (Minimum Curvature)")
@@ -212,7 +215,7 @@ with tab:
     shoe_md = float(st.session_state['shoe_md'])
     cased_mask = md <= shoe_md
 
-    # 3D path (correct orientation: deeper is lower)
+    # ----------- 3D plot (deeper lower; positive TVD) -----------
     idx = int(np.searchsorted(md, shoe_md, side='right'))
     fig3d = go.Figure()
     if idx > 1:
@@ -223,18 +226,26 @@ with tab:
                                      mode="lines", line=dict(width=4, color="#a97142"), name="Open-hole"))
     fig3d.update_layout(height=420, scene=dict(
         xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
-        zaxis=dict(autorange="reversed")
-    ), legend=dict(orientation="h"), margin=dict(l=10, r=10, t=10, b=10))
+        zaxis=dict(autorange="reversed")),
+        legend=dict(orientation="h"), margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig3d, use_container_width=True)
 
-    # 2D Wellbore Profile (Required: TVD vs Vertical Section)
+    # ----------- 2D TVD–VS split by Shoe MD (cased vs open-hole) -----------
     st.subheader("2D Wellbore Profile — TVD vs Vertical Section")
     vs_ref = st.number_input("VS reference azimuth (deg)", 0.0, 360.0, float(az[0] if len(az) else az_deg), 1.0)
-    vs_ref_rad = vs_ref * DEG2RAD
-    VS = N*np.cos(vs_ref_rad) + E*np.sin(vs_ref_rad)  # projection on reference azimuth
-    fig2d = go.Figure(go.Scatter(x=VS, y=TVD, mode="lines", name="Wellbore"))
+    VS = N*np.cos(vs_ref*DEG2RAD) + E*np.sin(vs_ref*DEG2RAD)
+
+    fig2d = go.Figure()
+    if idx > 1:
+        fig2d.add_trace(go.Scatter(x=VS[:idx], y=TVD[:idx], mode="lines",
+                                   line=dict(width=6, color="#4cc9f0"), name="Cased"))
+    if idx < len(md):
+        fig2d.add_trace(go.Scatter(x=VS[idx-1:], y=TVD[idx-1:], mode="lines",
+                                   line=dict(width=4, color="#a97142"), name="Open-hole"))
     fig2d.update_layout(xaxis_title="Vertical Section (ft)", yaxis_title="TVD (ft)",
-                        yaxis=dict(autorange="reversed"), height=360, margin=dict(l=10, r=10, t=10, b=10))
+                        yaxis=dict(autorange="reversed"),
+                        height=360, legend=dict(orientation="h"),
+                        margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig2d, use_container_width=True)
 
     st.dataframe(pd.DataFrame({
@@ -287,7 +298,6 @@ with tab:
         "DP":   {"od_in": dp_od,   "id_in": dp_id,   "w_air_lbft": dp_w},
     }
 
-    # curvature from DLS
     kappa = (DLS*DEG2RAD)/100.0
 
     # Not checked by default
@@ -330,7 +340,8 @@ with tab:
         rig_torque_lim = st.number_input("Top-drive torque limit (lbf-ft)", 10000, 150000, 60000, 1000)
         rig_pull_lim   = st.number_input("Rig max hookload (lbf)", 50000, 1500000, 500000, 5000)
 
-        mu_band = st.multiselect("μ sweep (applied to all regions, slide+rot)", [0.15,0.20,0.25,0.30,0.35,0.40],
+        mu_band = st.multiselect("μ sweep for off-bottom risk curves",
+                                 [0.15,0.20,0.25,0.30,0.35,0.40],
                                  default=[0.20,0.25,0.30,0.35])
 
         tj = TOOL_JOINT_DB[tj_name]
@@ -340,46 +351,7 @@ with tab:
 
         F_env, T_env = api7g_envelope_points(F_tensile_sf, T_yield_sf, n=100)
 
-        def run_td(mu: float, scen_key: str):
-            df_tmp, _, _ = soft_string_stepper(
-                md, inc_deg, kappa, cased_mask, comp_along, comp_props,
-                mu, mu, mu, mu, mw_ppg, scenario=scen_key, WOB_lbf=0.0, Mbit_ftlbf=0.0
-            )
-            depth_ = df_tmp["md_bot_ft"].to_numpy()
-            hook_  = np.maximum(0.0, -df_tmp["T_next_lbf"].to_numpy())
-            tor_   = np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
-            return depth_, hook_, tor_
-
-        # ---- Drag profiles (Required: Pickup/Slack-off/Rotating vs MD for multiple μ)
-        st.markdown("### Drag Profiles — μ overlays")
-        cD1, cD2, cD3 = st.columns(3)
-        # Pickup
-        fig_pick = go.Figure()
-        for mu in mu_band:
-            d, h, _ = run_td(mu, "pickup")
-            fig_pick.add_trace(go.Scatter(x=d, y=h/1000.0, mode="lines", name=f"μ={mu:.2f}"))
-        fig_pick.update_layout(xaxis_title="MD (ft)", yaxis_title="Pickup Hookload (klbf)",
-                               height=360, legend=dict(orientation="h"), margin=dict(l=10,r=10,t=10,b=10))
-        # Slack-off
-        fig_slack = go.Figure()
-        for mu in mu_band:
-            d, h, _ = run_td(mu, "slackoff")
-            fig_slack.add_trace(go.Scatter(x=d, y=h/1000.0, mode="lines", name=f"μ={mu:.2f}"))
-        fig_slack.update_layout(xaxis_title="MD (ft)", yaxis_title="Slack-off Hookload (klbf)",
-                                height=360, legend=dict(orientation="h"), margin=dict(l=10,r=10,t=10,b=10))
-        # Rotating off-bottom
-        fig_rot = go.Figure()
-        for mu in mu_band:
-            d, h, _ = run_td(mu, "rotate_off")
-            fig_rot.add_trace(go.Scatter(x=d, y=h/1000.0, mode="lines", name=f"μ={mu:.2f}"))
-        fig_rot.update_layout(xaxis_title="MD (ft)", yaxis_title="Rotating Weight (klbf)",
-                              height=360, legend=dict(orientation="h"), margin=dict(l=10,r=10,t=10,b=10))
-
-        with cD1: st.plotly_chart(fig_pick, use_container_width=True)
-        with cD2: st.plotly_chart(fig_slack, use_container_width=True)
-        with cD3: st.plotly_chart(fig_rot, use_container_width=True)
-
-        # ---- Your existing risk/limits/T&D visuals
+        # --- Off-bottom μ sweep (kept)
         def run_td_off_bottom(mu):
             df_tmp, _, _ = soft_string_stepper(
                 md, inc_deg, kappa, cased_mask, comp_along, comp_props,

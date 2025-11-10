@@ -1,411 +1,382 @@
-# td_app.py
-# Wellpath + Torque&Drag (Δs = 1 ft) — fixed session_state flow, linked tabs, depth-down 3D
-# Author: (Your team) — PEGN 517
-# Streamlit callbacks & rerun pattern per docs; depth-down via z = -TVD.  See refs in README.
+# -*- coding: utf-8 -*-
+# PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
+# Shared survey state across tabs + azimuth controls + Dr.-style T&D plots.
 
-from __future__ import annotations
-import math
-import numpy as np
-import pandas as pd
+import math, numpy as np, pandas as pd, streamlit as st
 import plotly.graph_objects as go
-import streamlit as st
 
-# -----------------------------------------------------------------------------
-# Utilities: safe state read + callbacks
-# -----------------------------------------------------------------------------
-def get_state(key: str, default=None):
-    return st.session_state.get(key, default)
+st.set_page_config(page_title="Wellpath + Torque & Drag", layout="wide")
 
-def set_az_from_quick():
-    mapping = {"North (0)": 0.0, "East (90)": 90.0, "South (180)": 180.0, "West (270)": 270.0}
-    sel = st.session_state.get("quick_az", "North (0)")
-    st.session_state["az_deg"] = mapping.get(sel, 0.0)
-    st.rerun()  # rerun after programmatic state change (legal & supported)
+# -------------------------- Utils & constants --------------------------
+DEG2RAD = math.pi/180.0
+def clamp(x,a,b): return max(a, min(b,x))
+def in2ft(x_in): return x_in/12.0
+def bf_from_mw(mw_ppg): return (65.5 - mw_ppg)/65.5  # steel ≈ 65.5 ppg
+def api_envelope(F_lim, T_lim, n=120):
+    F = np.linspace(0, max(F_lim,1.0), n)
+    T = T_lim*np.sqrt(np.clip(1.0-(F/max(F_lim,1.0))**2, 0.0, 1.0))
+    return F, T
 
-def push_td_az_into_trajectory():
-    st.session_state["az_deg"] = st.session_state.get("az_deg_td", 0.0)
-    st.rerun()
-
-# -----------------------------------------------------------------------------
-# API-ish constants (subset of API 5CT typical combos; extend as needed)
-# Nominal OD -> { weight_lbft: ID_in }
-# -----------------------------------------------------------------------------
+# -------------------------- Standards (subset) --------------------------
 CASING_DB = {
-    "13-3/8": {
-        48.0: 12.415,
-        54.5: 12.347,
-        61.0: 12.300,
-    },
-    "9-5/8": {
-        36.0: 8.921,
-        40.0: 8.535,
-        43.5: 8.347,
-    },
-    "7": {
-        20.0: 6.538,
-        23.0: 6.276,
-        26.0: 6.094,
-        29.0: 5.921,
-    },
+    "13-3/8": {"weights": {48.0:12.415, 54.5:12.347, 61.0:12.107}, "grades":["J55","L80","P110"]},
+    "9-5/8":  {"weights": {29.3:8.921, 36.0:8.535, 40.0:8.321},  "grades":["J55","L80","P110"]},
+    "7":      {"weights": {20.0:6.366, 23.0:6.059, 26.0:5.920},  "grades":["J55","L80","P110"]},
+    "5-1/2":  {"weights": {17.0:4.778, 20.0:4.670, 23.0:4.560},  "grades":["J55","L80","P110"]},
 }
 
-# -----------------------------------------------------------------------------
-# Geometry helpers (minimum curvature)
-# -----------------------------------------------------------------------------
-def rad(deg): return np.deg2rad(deg)
-def deg(radv): return np.rad2deg(radv)
+TOOL_JOINT_DB = {
+    'NC38': {'od': 4.75, 'id': 2.25, 'T_makeup_ftlbf': 12000, 'F_tensile_lbf': 350000, 'T_yield_ftlbf': 20000},
+    'NC40': {'od': 5.00, 'id': 2.25, 'T_makeup_ftlbf': 16000, 'F_tensile_lbf': 420000, 'T_yield_ftlbf': 25000},
+    'NC50': {'od': 6.63, 'id': 3.00, 'T_makeup_ftlbf': 30000, 'F_tensile_lbf': 650000, 'T_yield_ftlbf': 45000},
+}
 
-def minimum_curvature(md, inc_deg, az_deg):
-    """Compute TVD/N/E using minimum curvature. Inputs are arrays (same length)."""
-    md = np.asarray(md)
-    inc = rad(np.asarray(inc_deg))
-    az = rad(np.asarray(az_deg))
+# -------------------------- Session state --------------------------
+def init_state():
+    s = st.session_state
+    s.setdefault("profile", "Build & Hold")
+    s.setdefault("kop_md", 1000.0)
+    s.setdefault("br_deg_100", 3.0)
+    s.setdefault("theta_hold_deg", 30.0)
+    s.setdefault("drop_deg_100", 2.0)
+    s.setdefault("lateral_ft", 2000.0)
+    s.setdefault("target_md", 10000.0)
+    s.setdefault("az_deg", 0.0)              # NEW — shared azimuth (deg from North, cw)
+    s.setdefault("shoe_md", 3000.0)
+    s.setdefault("hole_od_in", 8.5)
+    s.setdefault("last_casing_nominal", "7")
+    s.setdefault("last_casing_weight", 20.0)
 
-    n = len(md)
-    tvd = np.zeros(n)
-    north = np.zeros(n)
-    east = np.zeros(n)
+init_state()
 
+def set_and_rerun(key, val):
+    st.session_state[key] = val
+    st.rerun()  # modern rerun API (experimental_rerun is deprecated)
+
+# -------------------------- Synthetic surveys --------------------------
+def synth_build_hold(kop_md, br_deg_100, theta_hold_deg, target_md, az_deg):
+    ds = 1.0
+    md = np.arange(0, target_md+ds, ds)
+    br = br_deg_100/100.0
+    inc = np.where(md<=kop_md, 0.0, np.minimum(theta_hold_deg, (md-kop_md)*br))
+    az = np.full_like(md, az_deg, dtype=float)
+    return md, inc, az
+
+def synth_build_hold_drop(kop_md, br_deg_100, theta_hold_deg, drop_deg_100, target_md, az_deg):
+    ds = 1.0
+    md = np.arange(0, target_md+ds, ds)
+    br = br_deg_100/100.0
+    inc = np.where(md<=kop_md, 0.0, np.minimum(theta_hold_deg, (md-kop_md)*br))
+    # simple drop over last 25% MD
+    start_drop = 0.75*target_md
+    dr = drop_deg_100/100.0
+    mask = md > start_drop
+    inc[mask] = np.maximum(0.0, inc[mask] - (md[mask]-start_drop)*dr)
+    az = np.full_like(md, az_deg, dtype=float)
+    return md, inc, az
+
+def synth_horizontal(kop_md, br_deg_100, lateral_ft, target_md, az_deg, theta_max=90.0):
+    ds = 1.0
+    md = np.arange(0, target_md+ds, ds)
+    br = br_deg_100/100.0
+    inc = np.where(md<=kop_md, 0.0, np.minimum(theta_max, (md-kop_md)*br))
+    idx = np.where(inc >= theta_max-1e-6)[0]
+    if len(idx):
+        m_h = md[idx[0]]
+        md_end = max(m_h + lateral_ft, target_md)
+        md = np.arange(0, md_end+ds, ds)
+        inc = np.where(md <= m_h, np.minimum(theta_max, np.maximum(0, (md-kop_md)*br)), theta_max)
+    az = np.full_like(md, az_deg, dtype=float)
+    return md, inc, az
+
+# Minimum Curvature positions + DLS (deg/100 ft)
+def mincurv_positions(md, inc_deg, az_deg):
+    ds = np.diff(md)
+    n = len(md); N = np.zeros(n); E = np.zeros(n); Z = np.zeros(n); DLS = np.zeros(n)
     for i in range(1, n):
-        dmd = md[i] - md[i-1]
-        inc1, inc2 = inc[i-1], inc[i]
-        az1, az2 = az[i-1], az[i]
+        I1, A1 = inc_deg[i-1]*DEG2RAD, az_deg[i-1]*DEG2RAD
+        I2, A2 = inc_deg[i]*DEG2RAD,   az_deg[i]*DEG2RAD
+        dmd = ds[i-1]
+        cos_dl = clamp(math.cos(I1)*math.cos(I2) + math.sin(I1)*math.sin(I2)*math.cos(A2-A1), -1.0, 1.0)
+        dpsi = math.acos(cos_dl)
+        RF = 1.0 if dpsi < 1e-12 else (2.0/dpsi)*math.tan(dpsi/2.0)
+        dN = 0.5*dmd*(math.sin(I1)*math.cos(A1)+math.sin(I2)*math.cos(A2))*RF
+        dE = 0.5*dmd*(math.sin(I1)*math.sin(A1)+math.sin(I2)*math.sin(A2))*RF
+        dZ = 0.5*dmd*(math.cos(I1)+math.cos(I2))*RF
+        N[i], E[i], Z[i] = N[i-1]+dN, E[i-1]+dE, Z[i-1]+dZ
+        DLS[i] = (dpsi/DEG2RAD)/dmd*100.0 if dmd>0 else 0.0
+    return N, E, Z, DLS
 
-        cos_dl = (np.sin(inc1)*np.sin(inc2)*np.cos(az2-az1) + np.cos(inc1)*np.cos(inc2))
-        cos_dl = np.clip(cos_dl, -1.0, 1.0)
-        dl = np.arccos(cos_dl)  # dogleg in radians
+# One place to build the survey from session_state (used by both tabs)
+def build_survey_from_state():
+    s = st.session_state
+    if s.profile == "Build & Hold":
+        md, inc, az = synth_build_hold(s.kop_md, s.br_deg_100, s.theta_hold_deg, s.target_md, s.az_deg)
+    elif s.profile == "Build–Hold–Drop":
+        md, inc, az = synth_build_hold_drop(s.kop_md, s.br_deg_100, s.theta_hold_deg, s.drop_deg_100, s.target_md, s.az_deg)
+    else:
+        md, inc, az = synth_horizontal(s.kop_md, s.br_deg_100, s.lateral_ft, s.target_md, s.az_deg)
+    N, E, TVD, DLS = mincurv_positions(md, inc, az)
+    return md, inc, az, N, E, TVD, DLS
 
-        if dl < 1e-12:
-            rf = 1.0
-        else:
-            rf = (2/ dl) * np.tan(dl/2)
+# -------------------------- Soft-string (Johancsik) --------------------------
+def soft_string_stepper(md, inc_deg, kappa_rad_per_ft, cased_mask,
+                        comp_along_depth, comp_props,
+                        mu_slide_cased, mu_slide_open, mu_rot_cased, mu_rot_open,
+                        mw_ppg, scenario="slackoff", WOB_lbf=0.0, Mbit_ftlbf=0.0):
+    ds = 1.0
+    md = np.asarray(md); inc_deg = np.asarray(inc_deg)
+    kappa = np.asarray(kappa_rad_per_ft)
+    if kappa.shape[0] == md.shape[0]:
+        kappa_seg = kappa[:-1]
+    else:
+        kappa_seg = kappa
+    nseg = md.shape[0]-1
+    inc = np.deg2rad(inc_deg[:-1])
+    BF = bf_from_mw(mw_ppg)
 
-        tvd[i]   = tvd[i-1]   + 0.5 * dmd * (np.cos(inc1) + np.cos(inc2)) * rf
-        north[i] = north[i-1] + 0.5 * dmd * (np.sin(inc1)*np.cos(az1) + np.sin(inc2)*np.cos(az2)) * rf
-        east[i]  = east[i-1]  + 0.5 * dmd * (np.sin(inc1)*np.sin(az1) + np.sin(inc2)*np.sin(az2)) * rf
+    # per-segment props
+    r_eff_ft = np.zeros(nseg); w_air = np.zeros(nseg); w_b = np.zeros(nseg)
+    mu_s = np.zeros(nseg); mu_r = np.zeros(nseg); cased_seg = np.asarray(cased_mask)[:nseg]
+    for i in range(nseg):
+        comp = comp_along_depth[i]
+        od = comp_props[comp]['od_in']; w_air[i] = comp_props[comp]['w_air_lbft']
+        w_b[i] = w_air[i]*BF; r_eff_ft[i] = 0.5*in2ft(od)
+        if cased_seg[i]: mu_s[i], mu_r[i] = mu_slide_cased, mu_rot_cased
+        else:            mu_s[i], mu_r[i] = mu_slide_open,  mu_rot_open
 
-    # DLS deg/100ft for info
-    dls_deg_per100 = np.zeros(n)
-    for i in range(1, n):
-        dmd = md[i] - md[i-1]
-        if dmd > 0:
-            dls_deg_per100[i] = deg(np.arccos(
-                np.sin(inc[i-1])*np.sin(inc[i])*np.cos(az[i]-az[i-1]) + np.cos(inc[i-1])*np.cos(inc[i])
-            )) * 100 / dmd
+    # integrate bit->surface
+    T = np.zeros(nseg+1); M = np.zeros(nseg+1)
+    if scenario == "onbottom": T[0], M[0] = -float(WOB_lbf), float(Mbit_ftlbf)
+    sgn_ax = +1.0 if scenario=="pickup" else -1.0 if scenario=="slackoff" else 0.0
 
-    return tvd, north, east, dls_deg_per100
+    dT = np.zeros(nseg); dM = np.zeros(nseg); Nside = np.zeros(nseg)
+    for i in range(nseg):
+        Nside[i] = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
+        T_next = T[i] + (sgn_ax*w_b[i]*math.cos(inc[i]) + mu_s[i]*Nside[i])*ds
+        M_next = M[i] + (mu_r[i]*Nside[i]*r_eff_ft[i])*ds
+        dT[i], dM[i] = T_next-T[i], M_next-M[i]
+        T[i+1], M[i+1] = T_next, M_next
 
-def synth_build_hold(kop_md, build_rate_deg_per100, theta_hold_deg, target_md, az_deg, ds=1.0):
-    """Simple synthetic Build & Hold path (inc increases from KOP at constant build, then holds)."""
-    md = np.arange(0.0, float(target_md) + ds, ds)
-    inc = np.zeros_like(md)
-    az = np.zeros_like(md) + float(az_deg)
+    df = pd.DataFrame({
+        "md_top_ft": md[:-1], "md_bot_ft": md[1:], "ds_ft": np.full(nseg,1.0),
+        "inc_deg": inc_deg[:-1], "kappa_rad_ft": kappa_seg,
+        "w_air_lbft": w_air, "BF": np.full(nseg, BF), "w_b_lbft": w_b,
+        "mu_slide": mu_s, "mu_rot": mu_r, "N_lbf": Nside,
+        "dT_lbf": dT, "T_next_lbf": T[1:], "r_eff_ft": r_eff_ft,
+        "dM_lbf_ft": dM, "M_next_lbf_ft": M[1:], "cased?": cased_seg,
+        "comp": np.asarray(comp_along_depth)[:nseg]
+    })
+    return df, T, M
 
-    # build until theta_hold or target
-    build_rate_deg_perft = build_rate_deg_per100 / 100.0
-    for i, m in enumerate(md):
-        if m < kop_md:
-            inc[i] = 0.0
-        else:
-            inc[i] = min(theta_hold_deg, max(0.0, (m - kop_md) * build_rate_deg_perft))
-
-    tvd, north, east, dls = minimum_curvature(md, inc, az)
-    return md, inc, az, tvd, north, east, dls
-
-# -----------------------------------------------------------------------------
-# Soft-string T&D (Johancsik-style stepper)
-# -----------------------------------------------------------------------------
-def soft_string_stepper(md, inc_deg, dls_deg100, cased_mask, mw_ppg,
-                        # hole geometry (for torque radius)
-                        casing_id_in, open_hole_diam_in,
-                        # friction
-                        mu_c_slide, mu_oh_slide, mu_c_rot, mu_oh_rot,
-                        # string from bit up
-                        dc_len, dc_od, dc_w_air,
-                        hwdp_len, hwdp_od, hwdp_w_air,
-                        dp_len, dp_od, dp_w_air,
-                        # boundary / scenario
-                        scenario="RIH", wob_lbf=0.0, bit_torque_lbf_ft=0.0):
-    """
-    Returns DataFrame with per-step forces/torque and overall surface hookload & torque.
-
-    Notes:
-      - Buoyancy: BF=(65.5-MW)/65.5 (ppg)
-      - Normal force per unit length N = w_b*sin(theta) + T*kappa
-      - Axial: T_next = T + (sigma*w_b*cos(theta) + mu*N)*ds, sigma = +1 POOH, -1 RIH
-      - Torque: M_next = M + mu_rot*N*r_eff*ds ; r_eff = (ID/2) for casing or (OH/2) in open hole
-    """
-    mw = float(mw_ppg)
-    BF = (65.5 - mw)/65.5  # buoyancy factor (ppg) — standard office formula
-
-    md = np.asarray(md)
-    inc = rad(np.asarray(inc_deg))
-    dls = np.asarray(dls_deg100)             # deg/100ft
-    ds = np.gradient(md)                     # may vary but we target 1 ft
-    kappa = np.deg2rad(dls/100.0)            # rad/ft
-
-    # Build per-foot air weights and OD along the string measured from bit (bottom) to surface.
-    total_len = float(dc_len + hwdp_len + dp_len)
-    # Map each MD to distance from bit:
-    depth_from_bit = (md[-1] - md)  # 0 at bit, increasing up to surface
-    w_air_perft = np.zeros_like(md) + dp_w_air
-    od_in = np.zeros_like(md) + dp_od
-    # HWDP segment:
-    mask_hwdp = depth_from_bit <= (hwdp_len + dc_len)
-    w_air_perft[mask_hwdp] = hwdp_w_air
-    od_in[mask_hwdp] = hwdp_od
-    # DC segment:
-    mask_dc = depth_from_bit <= dc_len
-    w_air_perft[mask_dc] = dc_w_air
-    od_in[mask_dc] = dc_od
-
-    # Buoyed weight per ft
-    w_b = w_air_perft * BF
-
-    # Effective radius for torque (cased vs open):
-    r_eff_ft = np.where(cased_mask, (casing_id_in/2.0)/12.0, (open_hole_diam_in/2.0)/12.0)
-
-    # Friction factors (sliding for axial; rotating for torque)
-    mu_slide = np.where(cased_mask, mu_c_slide, mu_oh_slide)
-    mu_rot   = np.where(cased_mask, mu_c_rot,   mu_oh_rot)
-
-    # Motion sign
-    sigma = -1.0 if scenario.lower().startswith("rih") else +1.0  # friction opposes motion
-
-    # Boundary at bit:
-    T = 0.0 - float(wob_lbf)  # on-bottom use negative WOB; off-bottom wob=0
-    M = float(bit_torque_lbf_ft)
-
-    # Iteration containers
-    T_list, M_list = [T], [M]
-    N_list, BF_list = [], []  # store for debugging/trace
-
-    for i in range(len(md)-1, 0, -1):  # integrate from bit (end) to surface (start)
-        # use angle at "i" (closer to bit) for gravity components
-        theta = inc[i]
-        ds_i  = md[i] - md[i-1]
-        k_i   = kappa[i]
-        mu_s  = mu_slide[i]
-        mu_r  = mu_rot[i]
-        w_b_i = w_b[i]
-
-        # normal per unit length
-        N = w_b_i * abs(np.sin(theta)) + abs(T) * abs(k_i)
-
-        dT = (sigma * w_b_i * np.cos(theta) + mu_s * N) * ds_i
-        T_next = T + dT
-
-        dM = (mu_r * N * r_eff_ft[i]) * ds_i
-        M_next = M + dM
-
-        N_list.append(N)
-        BF_list.append(BF)
-        T_list.append(T_next); M_list.append(M_next)
-        T, M = T_next, M_next
-
-    # reverse lists to align from surface->bit
-    T_arr = np.array(T_list[::-1])
-    M_arr = np.array(M_list[::-1])
-    N_arr = np.array(N_list[::-1])
-    # pad N to same length
-    N_arr = np.pad(N_arr, (1, 0), constant_values=N_arr[0] if N_arr.size else 0.0)
-
-    df = pd.DataFrame(dict(
-        md_ft = md,
-        inc_deg = np.degrees(inc),
-        dls_deg100 = dls,
-        w_air_lbft = w_air_perft,
-        w_b_lbft = w_b,
-        mu_slide = mu_slide,
-        mu_rot = mu_rot,
-        N_lbf = N_arr,
-        T_lbf = T_arr,
-        M_lbf_ft = M_arr,
-        cased = cased_mask.astype(bool),
-    ))
-    return df, float(T_arr[0]), float(M_arr[0])
-
-# -----------------------------------------------------------------------------
-# UI – Page
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="Wellpath + Torque & Drag (Δs = 1 ft)", layout="wide")
+# -------------------------- UI --------------------------
 st.title("Wellpath + Torque & Drag (Δs = 1 ft)")
 
-tabs = st.tabs(["Trajectory & 3D schematic", "Torque & Drag"])
+tab1, tab2 = st.tabs(["Trajectory & 3D schematic", "Torque & Drag"])
 
-# --- TRAJECTORY TAB ---
-with tabs[0]:
+# ---- Tab 1: Survey controls (write into session_state) ----
+with tab1:
+    s = st.session_state
     st.subheader("Synthetic survey (Minimum Curvature)")
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.selectbox("Profile", ["Build & Hold"], key="profile")
-    c2.number_input("KOP MD (ft)", min_value=0.0, step=100.0, key="kop_md", value=get_state("kop_md", 1000.0))
-    c3.selectbox("Quick azimuth", ["North (0)", "East (90)", "South (180)", "West (270)"],
-                 key="quick_az", on_change=set_az_from_quick)
-    c4.number_input("Azimuth (deg from North, clockwise)", min_value=-360.0, max_value=720.0, step=1.0,
-                    key="az_deg", value=get_state("az_deg", 0.0))
+    s.profile = c1.selectbox("Profile", ["Build & Hold","Build–Hold–Drop","Horizontal (build + lateral)"],
+                             index=["Build & Hold","Build–Hold–Drop","Horizontal (build + lateral)"].index(s.profile), key="profile")
+    s.kop_md = c2.number_input("KOP MD (ft)", 0.0, 50000.0, s.kop_md, 50.0, key="kop_md")
+
+    # NEW — quick azimuth + numeric azimuth, both write the same 'az_deg' key
+    def pick_az(preset):
+        mapping = {"North (0)":0.0,"East (90)":90.0,"South (180)":180.0,"West (270)":270.0}
+        set_and_rerun("az_deg", mapping[preset])
+    c3.selectbox("Quick azimuth", ["North (0)","East (90)","South (180)","West (270)"],
+                 index={0.0:0,90.0:1,180.0:2,270.0:3}.get(s.az_deg,0), on_change=pick_az,
+                 args=("North (0)" if s.az_deg==0 else "East (90)" if s.az_deg==90 else
+                       "South (180)" if s.az_deg==180 else "West (270)",))
+    s.az_deg = c4.number_input("Azimuth (deg from North, cw)", -360.0, 720.0, s.az_deg, 1.0, key="az_deg")
 
     c5, c6, c7 = st.columns(3)
-    c5.number_input("Build rate (deg/100 ft)", min_value=0.0, step=0.1, key="build_rate", value=get_state("build_rate", 3.0))
-    c6.number_input("Final inclination (deg)", min_value=0.0, step=0.1, key="theta_hold", value=get_state("theta_hold", 30.0))
-    c7.number_input("Target MD (ft)", min_value=0.0, step=100.0, key="target_md", value=get_state("target_md", 10000.0))
+    s.br_deg_100 = c5.number_input("Build rate (deg/100 ft)", 0.0, 20.0, s.br_deg_100, 0.1, key="br_deg_100")
+    if s.profile == "Build & Hold":
+        s.theta_hold_deg = c6.number_input("Final inclination (deg)", 0.0, 90.0, s.theta_hold_deg, 0.5, key="theta_hold_deg")
+        s.target_md = c7.number_input("Target MD (ft)", 100.0, 100000.0, s.target_md, 100.0, key="target_md")
+    elif s.profile == "Build–Hold–Drop":
+        s.theta_hold_deg = c6.number_input("Hold inclination (deg)", 0.0, 90.0, s.theta_hold_deg, 0.5, key="theta_hold_deg")
+        s.drop_deg_100   = c7.number_input("Drop rate (deg/100 ft)", 0.0, 20.0, s.drop_deg_100, 0.1, key="drop_deg_100")
+        s.target_md = st.number_input("Target MD (ft)", 100.0, 100000.0, s.target_md, 100.0, key="target_md")
+    else:
+        s.lateral_ft = c6.number_input("Lateral length (ft)", 0.0, 30000.0, s.lateral_ft, 100.0, key="lateral_ft")
+        s.target_md  = c7.number_input("Target MD (ft)", 100.0, 100000.0, s.target_md, 100.0, key="target_md")
 
-    # Casing / open hole simple inputs
-    st.markdown("### Casing / Open-hole (simple)")
-    cA, cB, cC, cD = st.columns([1.2,1.2,1.2,1.2])
-    cA.selectbox("Last casing nominal OD", list(CASING_DB.keys()), key="last_nom_od", index=2)
-    # weights depend on nominal OD
-    weights = sorted(CASING_DB[get_state("last_nom_od")].keys())
-    cB.selectbox("lb/ft (standards only)", weights, key="last_lbft", index=1)
-    casing_id = CASING_DB[get_state("last_nom_od")][get_state("last_lbft")]
-    cC.text_input("Casing ID (in, locked)", value=f"{casing_id:.3f}", key="last_casing_id_locked", disabled=True)
-    cD.number_input("Deepest shoe MD (ft)", min_value=0.0, step=50.0, key="shoe_md", value=get_state("shoe_md", 3000.0))
+    md, inc_deg, az, N, E, TVD, DLS = build_survey_from_state()
 
-    st.number_input("Open hole diameter (in)", min_value=4.75, max_value=26.0, step=0.25, key="oh_diam_in",
-                    value=get_state("oh_diam_in", 8.50))
+    # Cased vs open-hole mask for plot (from session shoe_md)
+    cased_mask_plot = md <= s.shoe_md
 
-    # READ all values (safe)
-    kop_md    = float(get_state("kop_md", 1000.0))
-    az_deg    = float(get_state("az_deg", 0.0))
-    brate     = float(get_state("build_rate", 3.0))
-    theta_hold= float(get_state("theta_hold", 30.0))
-    target_md = float(get_state("target_md", 10000.0))
-    shoe_md   = float(get_state("shoe_md", 3000.0))
-    oh_in     = float(get_state("oh_diam_in", 8.5))
-    casing_id_in = float(casing_id)
+    # 3D plot: depth down (z reversed), cased vs open-hole
+    def add_colored_segments(fig, x, y, z, mask, name_true, name_false,
+                             color_true="#1f77b4", color_false="#8B4513",
+                             width_true=8, width_false=5):
+        idx = np.arange(len(x))
+        for which, color, width, nm in [(True,color_true,width_true,name_true),
+                                        (False,color_false,width_false,name_false)]:
+            m = (mask == which)
+            if not m.any(): continue
+            runs = np.split(idx[m], np.where(np.diff(idx[m]) != 1)[0]+1)
+            for run in runs:
+                fig.add_trace(go.Scatter3d(
+                    x=x[run], y=y[run], z=z[run], mode="lines",
+                    line=dict(color=color, width=width), name=nm, showlegend=True
+                ))
 
-    # Build synthetic path
-    md, inc, az, tvd, north, east, dls = synth_build_hold(kop_md, brate, theta_hold, target_md, az_deg, ds=1.0)
-    cased_mask = md <= shoe_md
+    fig3d = go.Figure()
+    add_colored_segments(fig3d, E, N, TVD, cased_mask_plot, "Cased", "Open-hole")
+    fig3d.update_layout(height=520,
+        scene=dict(xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
+                   zaxis=dict(autorange="reversed")),
+        legend=dict(orientation="h", yanchor="bottom", y=0.02, x=0.02))
+    st.plotly_chart(fig3d, use_container_width=True)
 
-    # Save the trajectory for the T&D tab
-    st.session_state["traj"] = dict(md=md, inc=inc, az=az, tvd=tvd, north=north, east=east, dls=dls)
-    st.session_state["traj_meta"] = dict(cased_mask=cased_mask, casing_id_in=casing_id_in, open_hole_in=oh_in)
-
-    # 3D plot (depth-down via z = -TVD).  Separate traces for cased vs open hole.
-    fig = go.Figure()
-    # Segment indices where cased changes to open
-    segments = []
-    current = cased_mask[0]
-    start = 0
-    for i in range(1, len(md)):
-        if cased_mask[i] != current:
-            segments.append((current, start, i))
-            start = i
-            current = cased_mask[i]
-    segments.append((current, start, len(md)-1))
-
-    for is_cased, i0, i1 in segments:
-        color = "steelblue" if is_cased else "saddlebrown"
-        width = 6 if is_cased else 5
-        fig.add_trace(go.Scatter3d(
-            x=east[i0:i1+1], y=north[i0:i1+1], z=-tvd[i0:i1+1],  # depth-down
-            mode="lines", line=dict(color=color, width=width),
-            name="Cased" if is_cased else "Open hole"
-        ))
-
-    fig.update_layout(
-        height=360, margin=dict(l=0,r=0,t=0,b=0),
-        scene=dict(
-            xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft, down)",
-            bgcolor="rgba(0,0,0,0)",
-        ),
-        legend=dict(orientation="h", x=0.0, y=1.02)
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Survey table (first few rows)
-    df_svy = pd.DataFrame(dict(MD_ft=md, Inc_deg=inc, Az_deg=az, TVD_ft=tvd, North_ft=north, East_ft=east, DLS_deg100=dls))
-    df_svy["Inc_deg"] = df_svy["Inc_deg"].round(3)
-    df_svy["Az_deg"] = df_svy["Az_deg"].round(3)
-    df_svy["DLS_deg100"] = df_svy["DLS_deg100"].round(3)
     st.markdown("**Survey and calculated positions (first 11 rows)**")
-    st.dataframe(df_svy.head(11), use_container_width=True)
+    survey_df = pd.DataFrame({"MD (ft)":md, "Inc (deg)":inc_deg, "Az (deg)":az,
+                              "TVD (ft)":TVD, "North (ft)":N, "East (ft)":E, "DLS (deg/100 ft)":DLS})
+    st.dataframe(survey_df.head(11), use_container_width=True)
+    st.caption("Minimum Curvature with ratio factor; azimuth is deg from North, clockwise.")
 
-    st.caption("Δs = 1 ft; minimum curvature with ratio factor; industry depth-down 3D (using z=−TVD).")
+# ---- Tab 2: T&D (reads & writes the same session_state) ----
+with tab2:
+    s = st.session_state
+    st.subheader("Casing / Open-hole (simple)")
+    cc1, cc2, cc3, cc4, cc5 = st.columns([1,1,1,1,1])
+    s.last_casing_nominal = cc1.selectbox("Last casing nominal OD", list(CASING_DB.keys()),
+                                          index=list(CASING_DB.keys()).index(s.last_casing_nominal), key="last_casing_nominal")
+    s.last_casing_weight  = cc2.selectbox("lb/ft (standards only)",
+                                          list(CASING_DB[s.last_casing_nominal]["weights"].keys()),
+                                          index=list(CASING_DB[s.last_casing_nominal]["weights"].keys()).index(s.last_casing_weight),
+                                          key="last_casing_weight")
+    casing_id_in = CASING_DB[s.last_casing_nominal]["weights"][s.last_casing_weight]
+    cc3.text_input("Casing ID (in, locked)", f"{casing_id_in:.3f}", disabled=True)
+    s.shoe_md = cc4.number_input("Deepest shoe MD (ft)", 0.0, float(md[-1]), min(s.shoe_md, float(md[-1])), 50.0, key="shoe_md")
+    s.hole_od_in = cc5.number_input("Open-hole diameter (in)", 4.0, 20.0, s.hole_od_in, 0.1, key="hole_od_in")
 
-# --- T&D TAB ---
-with tabs[1]:
-    st.subheader("Soft-string Torque & Drag (Johancsik) — with buoyancy")
+    st.subheader("Soft-string T&D — inputs")
+    mu_cased_slide = st.number_input("μ in casing (sliding)", 0.05, 0.80, 0.25, 0.01)
+    mu_open_slide  = st.number_input("μ in open-hole (sliding)", 0.05, 0.80, 0.35, 0.01)
+    mu_cased_rot   = st.number_input("μ in casing (rotating)", 0.05, 0.80, 0.25, 0.01)
+    mu_open_rot    = st.number_input("μ in open-hole (rotating)", 0.05, 0.80, 0.35, 0.01)
+    mw_ppg         = st.number_input("Mud weight (ppg)", 7.0, 20.0, 10.0, 0.1)
 
-    # Quick link: azimuth control for T&D (writes back using callback)
-    st.number_input("Azimuth for T&D (deg)", min_value=-360.0, max_value=720.0, step=1.0,
-                    value=get_state("az_deg", 0.0), key="az_deg_td", on_change=push_td_az_into_trajectory)
+    # (Optional) also expose azimuth here using the SAME key so you can adjust from this tab too
+    st.markdown("**Well azimuth** (same as survey tab)")
+    s.az_deg = st.number_input("Azimuth (deg from North, cw)", -360.0, 720.0, s.az_deg, 1.0, key="az_deg_td")
 
-    # Friction & MW
-    c1, c2, c3, c4 = st.columns(4)
-    c1.number_input("μ in casing (sliding)", min_value=0.0, max_value=1.0, step=0.01, key="mu_c_slide", value=get_state("mu_c_slide", 0.25))
-    c2.number_input("μ in open hole (sliding)", min_value=0.0, max_value=1.0, step=0.01, key="mu_oh_slide", value=get_state("mu_oh_slide", 0.35))
-    c3.number_input("μ in casing (rotating)", min_value=0.0, max_value=1.0, step=0.01, key="mu_c_rot", value=get_state("mu_c_rot", 0.25))
-    c4.number_input("μ in open hole (rotating)", min_value=0.0, max_value=1.0, step=0.01, key="mu_oh_rot", value=get_state("mu_oh_rot", 0.35))
-
-    st.number_input("Mud weight (ppg)", min_value=0.0, step=0.1, key="mw_ppg", value=get_state("mw_ppg", 10.0))
-
-    # Drillstring inputs (bit up)
     st.markdown("**Drillstring (bit up)**")
-    g1, g2, g3 = st.columns(3)
-    # DC
-    with g1:
-        st.number_input("DC length (ft)", min_value=0.0, step=10.0, key="dc_len", value=get_state("dc_len", 600.0))
-        st.number_input("DC weight (air, lb/ft)", min_value=0.0, step=0.1, key="dc_w_air", value=get_state("dc_w_air", 66.7))
-        st.number_input("DC OD (in)", min_value=1.0, step=0.01, key="dc_od", value=get_state("dc_od", 8.00))
-    with g2:
-        st.number_input("HWDP length (ft)", min_value=0.0, step=10.0, key="hwdp_len", value=get_state("hwdp_len", 1000.0))
-        st.number_input("HWDP weight (air, lb/ft)", min_value=0.0, step=0.1, key="hwdp_w_air", value=get_state("hwdp_w_air", 16.0))
-        st.number_input("HWDP OD (in)", min_value=1.0, step=0.01, key="hwdp_od", value=get_state("hwdp_od", 3.50))
-    with g3:
-        st.number_input("DP length (ft)", min_value=0.0, step=10.0, key="dp_len", value=get_state("dp_len", 7000.0))
-        st.number_input("DP weight (air, lb/ft)", min_value=0.0, step=0.1, key="dp_w_air", value=get_state("dp_w_air", 19.5))
-        st.number_input("DP OD (in)", min_value=1.0, step=0.01, key="dp_od", value=get_state("dp_od", 5.00))
+    d1, d2, d3 = st.columns(3)
+    dc_len = d1.number_input("DC length (ft)", 0.0, 10000.0, 600.0, 10.0)
+    dc_od  = d2.number_input("DC OD (in)", 3.0, 12.0, 8.0, 0.1)
+    dc_id  = d3.number_input("DC ID (in)", 0.5, 6.0, 2.81, 0.01)
+    dc_w   = st.number_input("DC weight (air, lb/ft)", 30.0, 150.0, 66.7, 0.1)
 
-    # Scenario
-    st.selectbox("Scenario", ["Slack-off (RIH)", "Pickup (POOH)"], key="scenario")
-    c1, c2 = st.columns(2)
-    c1.number_input("WOB (lbf) for on-bottom", min_value=0.0, step=100.0, key="wob_lbf", value=get_state("wob_lbf", 6000.0))
-    c2.number_input("Bit torque (lbf-ft) for on-bottom", min_value=0.0, step=10.0, key="bit_tq", value=get_state("bit_tq", 0.0))
+    h1, h2, h3 = st.columns(3)
+    hwdp_len = h1.number_input("HWDP length (ft)", 0.0, 20000.0, 1000.0, 10.0)
+    hwdp_od  = h2.number_input("HWDP OD (in)", 2.0, 8.0, 3.5, 0.1)
+    hwdp_id  = h3.number_input("HWDP ID (in)", 0.5, 4.0, 2.0, 0.01)
+    hwdp_w   = st.number_input("HWDP weight (air, lb/ft)", 5.0, 40.0, 16.0, 0.1)
 
-    # Pull trajectory from state
-    traj = get_state("traj")
-    meta = get_state("traj_meta")
-    if not traj or not meta:
-        st.warning("Define the wellpath in the Trajectory tab first.")
-        st.stop()
+    p1, p2, p3 = st.columns(3)
+    dp_len = p1.number_input("DP length (ft)", 0.0, 50000.0, max(0.0, float(md[-1]) - (dc_len + hwdp_len)), 10.0)
+    dp_od  = p2.number_input("DP OD (in)", 3.0, 6.625, 5.0, 0.01)
+    dp_id  = p3.number_input("DP ID (in)", 1.5, 5.0, 4.28, 0.01)
+    dp_w   = st.number_input("DP weight (air, lb/ft)", 10.0, 30.0, 19.5, 0.1)
 
-    md    = traj["md"]; inc = traj["inc"]; az = traj["az"]
-    dls   = traj["dls"]
-    cased_mask = meta["cased_mask"]
-    casing_id_in = meta["casing_id_in"]
-    open_hole_in = meta["open_hole_in"]
+    # Build survey again from session (ensures T&D always uses current trajectory incl. azimuth)
+    md, inc_deg, az, N, E, TVD, DLS = build_survey_from_state()
+    cased_mask = md <= s.shoe_md
+    kappa = (DLS*DEG2RAD)/100.0
 
-    # Compute
-    df, hook_surf, torque_surf = soft_string_stepper(
-        md, inc, dls, cased_mask,
-        get_state("mw_ppg", 10.0),
-        casing_id_in, open_hole_in,
-        get_state("mu_c_slide", 0.25), get_state("mu_oh_slide", 0.35),
-        get_state("mu_c_rot", 0.25),   get_state("mu_oh_rot", 0.35),
-        get_state("dc_len", 600.0), get_state("dc_od", 8.00), get_state("dc_w_air", 66.7),
-        get_state("hwdp_len", 1000.0), get_state("hwdp_od", 3.50), get_state("hwdp_w_air", 16.0),
-        get_state("dp_len", 7000.0), get_state("dp_od", 5.00), get_state("dp_w_air", 19.5),
-        scenario=get_state("scenario", "Slack-off (RIH)"),
-        wob_lbf=get_state("wob_lbf", 6000.0), bit_torque_lbf_ft=get_state("bit_tq", 0.0)
+    # map components along depth
+    nseg = len(md)-1
+    comp_along = np.empty(nseg, dtype=object)
+    for i in range(nseg):
+        dist_up = float(md[-1]) - md[i]
+        comp_along[i] = "DC" if dist_up <= dc_len else "HWDP" if dist_up <= dc_len+hwdp_len else "DP"
+    comp_props = {"DC":{"od_in":dc_od,"id_in":dc_id,"w_air_lbft":dc_w},
+                  "HWDP":{"od_in":hwdp_od,"id_in":hwdp_id,"w_air_lbft":hwdp_w},
+                  "DP":{"od_in":dp_od,"id_in":dp_id,"w_air_lbft":dp_w}}
+
+    scen = st.selectbox("Scenario", ["Slack-off (RIH)","Pickup (POOH)","Rotate off-bottom","Rotate on-bottom"])
+    scenario = "slackoff" if "Slack-off" in scen else "pickup" if "Pickup" in scen else \
+               "rotate_off" if "Rotate off-bottom" in scen else "onbottom"
+    wob  = st.number_input("WOB (lbf) for on-bottom", 0.0, 100000.0, 6000.0, 100.0)
+    mbit = st.number_input("Bit torque (lbf-ft) for on-bottom", 0.0, 50000.0, 0.0, 100.0)
+
+    df_itr, T_arr, M_arr = soft_string_stepper(
+        md, inc_deg, kappa, cased_mask, comp_along, comp_props,
+        mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
+        mw_ppg, scenario=scenario, WOB_lbf=wob, Mbit_ftlbf=mbit
     )
 
-    st.success(f"Surface hookload: **{hook_surf:,.0f} lbf** — Surface torque: **{torque_surf:,.0f} lbf·ft**")
+    depth = df_itr["md_bot_ft"].to_numpy()
+    surf_hookload = max(0.0, -T_arr[-1]); surf_torque = abs(M_arr[-1])
+    st.success(f"Surface hookload: {surf_hookload:,.0f} lbf — Surface torque: {surf_torque:,.0f} lbf-ft")
 
-    # Plots
-    c1, c2 = st.columns(2)
-    with c1:
-        figT = go.Figure()
-        figT.add_trace(go.Scatter(x=df["md_ft"], y=df["T_lbf"], mode="lines", name="Tension / Hookload"))
-        figT.update_layout(xaxis_title="MD (ft)", yaxis_title="lbf", height=300, margin=dict(l=30,r=10,t=10,b=30))
-        st.plotly_chart(figT, use_container_width=True)
-    with c2:
-        figM = go.Figure()
-        figM.add_trace(go.Scatter(x=df["md_ft"], y=df["M_lbf_ft"], mode="lines", name="Torque"))
-        figM.update_layout(xaxis_title="MD (ft)", yaxis_title="lbf·ft", height=300, margin=dict(l=30,r=10,t=10,b=30))
-        st.plotly_chart(figM, use_container_width=True)
+    # Doctor-style risk plots (defaults)
+    tj_name = st.selectbox("Tool-joint size", list(TOOL_JOINT_DB.keys()), index=2)
+    sf_joint = st.number_input("Safety factor (tool-joint)", 1.00, 2.00, 1.10, 0.05)
+    rig_torque = st.number_input("Top-drive torque limit (lbf-ft)", 10000, 150000, 60000, 1000)
+    mu_band = st.multiselect("μ sweep for off-bottom risk curves", [0.15,0.20,0.25,0.30,0.35,0.40],
+                             default=[0.20,0.25,0.30,0.35])
 
-    # Iteration trace (compact)
-    st.markdown("**Iteration trace (bit → surface)**")
-    cols = ["md_ft","inc_deg","dls_deg100","w_air_lbft","w_b_lbft","mu_slide","mu_rot","N_lbf","T_lbf","M_lbf_ft","cased"]
-    st.dataframe(df[cols].head(200), use_container_width=True)
+    tj = TOOL_JOINT_DB[tj_name]
+    T_makeup_sf = tj['T_makeup_ftlbf']/sf_joint
+    T_yield_sf  = tj['T_yield_ftlbf']/sf_joint
+    F_tens_sf   = tj['F_tensile_lbf']/sf_joint
+    _, _ = api_envelope(F_tens_sf, T_yield_sf, n=120)
+
+    def run_offbottom(mu):
+        df_tmp, _, _ = soft_string_stepper(
+            md, inc_deg, kappa, cased_mask, comp_along, comp_props,
+            mu, mu, mu, mu, mw_ppg, scenario="rotate_off", WOB_lbf=0.0, Mbit_ftlbf=0.0
+        )
+        return df_tmp["md_bot_ft"].to_numpy(), np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
+
+    # Left: μ curves (off-bottom torque risk)
+    fig_left = go.Figure()
+    for mu in mu_band:
+        d_mu, t_mu = run_offbottom(mu)
+        fig_left.add_trace(go.Scatter(x=t_mu/1000.0, y=d_mu, mode="lines", name=f"μ={mu:.2f}"))
+    fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
+                       annotation_text="Make-up / SF", annotation_position="top")
+    fig_left.add_vline(x=rig_torque/1000.0, line_color="magenta", line_dash="dot",
+                       annotation_text="Top-drive", annotation_position="top")
+    fig_left.update_xaxes(title_text="Off-bottom Torque (k lbf-ft)")
+    fig_left.update_yaxes(title_text="Depth (ft)", autorange="reversed")
+    fig_left.update_layout(height=700, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
+
+    # Right: elemental torque contribution + limits
+    comp = df_itr['comp'].to_numpy(); dM = df_itr['dM_lbf_ft'].to_numpy()
+    tor_dc = np.cumsum(np.where(comp=="DC", dM, 0.0))
+    tor_hw = np.cumsum(np.where(comp=="HWDP", dM, 0.0))
+    tor_dp = np.cumsum(np.where(comp=="DP", dM, 0.0))
+    tor_total = np.cumsum(dM)
+    fig_right = go.Figure()
+    fig_right.add_trace(go.Scatter(x=tor_dc/1000.0,   y=depth, name="DC",   mode="lines"))
+    fig_right.add_trace(go.Scatter(x=tor_hw/1000.0,   y=depth, name="HWDP", mode="lines"))
+    fig_right.add_trace(go.Scatter(x=tor_dp/1000.0,   y=depth, name="DP",   mode="lines"))
+    fig_right.add_trace(go.Scatter(x=tor_total/1000.0,y=depth, name="Total", mode="lines", line=dict(width=3)))
+    fig_right.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
+                        annotation_text="Make-up / SF")
+    fig_right.add_vline(x=rig_torque/1000.0, line_color="magenta", line_dash="dot",
+                        annotation_text="Top-drive")
+    fig_right.update_xaxes(title_text="Elemental Torque (k lbf-ft)")
+    fig_right.update_yaxes(title_text="Depth (ft)", autorange="reversed")
+    fig_right.update_layout(height=700, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
+
+    cL, cR = st.columns(2)
+    cL.plotly_chart(fig_left,  use_container_width=True)
+    cR.plotly_chart(fig_right, use_container_width=True)
+
+    st.markdown("### Iteration trace (first 12 rows)")
+    st.dataframe(df_itr.head(12), use_container_width=True)
+    st.caption("Trajectory and friction are linked via shared session state; "
+               "survey recomputes with azimuth & geometry on every rerun. "
+               "State across tabs uses Streamlit session_state & rerun callbacks.")

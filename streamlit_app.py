@@ -3,9 +3,11 @@
 """
 PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
 One-tab app: survey → casing/open-hole → T&D.
-Changes:
-- Removed "Drag Profiles — μ overlays" (three small plots).
-- 2D TVD–VS profile split by Shoe MD, colors match 3D (cased cyan, open-hole brown).
+Current deltas:
+- 3D TVD orientation fixed (deeper lower).
+- 2D TVD–VS split by Shoe MD: Cased (cyan) vs Open-hole (brown).
+- Classic simple view unchecked by default.
+- RIGHT PLOT FIX: Elemental torque vs depth uses total torque (M_next) masked by section.
 """
 
 from __future__ import annotations
@@ -130,7 +132,7 @@ def soft_string_stepper(md, inc_deg, kappa_rad_per_ft, cased_mask,
     dT = np.zeros(nseg);  dM = np.zeros(nseg);  N_side = np.zeros(nseg)
 
     if scenario == "onbottom":
-        T[0] = -float(WOB_lbf)  # impose WOB at bit
+        T[0] = -float(WOB_lbf)  # why: impose WOB at bit
         M[0] = float(Mbit_ftlbf)
 
     sgn_ax = {"pickup": +1.0, "slackoff": -1.0}.get(scenario, 0.0)
@@ -300,7 +302,6 @@ with tab:
 
     kappa = (DLS*DEG2RAD)/100.0
 
-    # Not checked by default
     simple_mode = st.checkbox("Use classic simple view (hide safety overlays & μ-sweep)", value=False)
 
     scen = st.selectbox("Scenario", ["Slack-off (RIH)","Pickup (POOH)","Rotate off-bottom","Rotate on-bottom"])
@@ -351,7 +352,7 @@ with tab:
 
         F_env, T_env = api7g_envelope_points(F_tensile_sf, T_yield_sf, n=100)
 
-        # --- Off-bottom μ sweep (kept)
+        # --- LEFT PLOT (μ-sweep off-bottom torque vs depth) ---
         def run_td_off_bottom(mu):
             df_tmp, _, _ = soft_string_stepper(
                 md, inc_deg, kappa, cased_mask, comp_along, comp_props,
@@ -369,18 +370,21 @@ with tab:
         fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)")
         fig_left.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
 
-        comp = df_itr['comp'].to_numpy(); dM = df_itr['dM_lbf_ft'].to_numpy()
-        tor_dc   = np.cumsum(np.where(comp=='DC',   dM, 0.0))
-        tor_hwdp = np.cumsum(np.where(comp=='HWDP', dM, 0.0))
-        tor_dp   = np.cumsum(np.where(comp=='DP',   dM, 0.0))
-        tor_total= np.cumsum(dM)
-        hookload = np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())
+        # --- RIGHT PLOT (Elemental torque vs depth) — FIXED ---
+        comp  = df_itr["comp"].to_numpy()
+        tor   = np.abs(df_itr["M_next_lbf_ft"].to_numpy())  # total torque along string
+        # mask by component; why: show torque present in that section due to all below
+        tor_dc    = np.where(comp == "DC",   tor, np.nan)
+        tor_hwdp  = np.where(comp == "HWDP", tor, np.nan)
+        tor_dp    = np.where(comp == "DP",   tor, np.nan)
+        tor_total = tor
 
         fig_right = go.Figure()
-        fig_right.add_trace(go.Scatter(x=tor_dc/1000.0,   y=depth, name="DC",   mode="lines"))
-        fig_right.add_trace(go.Scatter(x=tor_hwdp/1000.0, y=depth, name="HWDP", mode="lines"))
-        fig_right.add_trace(go.Scatter(x=tor_dp/1000.0,   y=depth, name="DP",   mode="lines"))
-        fig_right.add_trace(go.Scatter(x=tor_total/1000.0,y=depth, name="Total", mode="lines", line=dict(width=3)))
+        fig_right.add_trace(go.Scatter(x=tor_dc/1000.0,   y=depth, name="DC",   mode="lines", connectgaps=False))
+        fig_right.add_trace(go.Scatter(x=tor_hwdp/1000.0, y=depth, name="HWDP", mode="lines", connectgaps=False))
+        fig_right.add_trace(go.Scatter(x=tor_dp/1000.0,   y=depth, name="DP",   mode="lines", connectgaps=False))
+        fig_right.add_trace(go.Scatter(x=tor_total/1000.0,y=depth, name="Total",mode="lines",
+                                       line=dict(width=3), connectgaps=False))
         fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
         fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
         fig_right.update_yaxes(autorange="reversed", title_text="Depth (ft)")
@@ -404,13 +408,14 @@ with tab:
         fig_env.add_trace(go.Scatter(x=(T_env)/1000.0, y=(F_env)/1000.0, mode="lines", name="API 7G envelope (approx)"))
         fig_env.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
         fig_env.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
-        fig_env.add_trace(go.Scatter(x=[abs(tor_total[-1])/1000.0], y=[hookload[-1]/1000.0], mode="markers",
-                                     name="Operating point", marker=dict(size=10, color="orange")))
+        fig_env.add_trace(go.Scatter(x=[abs(tor_total[-1])/1000.0], y=[np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())[-1]/1000.0],
+                                     mode="markers", name="Operating point", marker=dict(size=10, color="orange")))
         fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
         fig_env.update_yaxes(title_text="Tension (k lbf)")
         fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
 
         fig_hl = go.Figure()
+        hookload = np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())
         fig_hl.add_trace(go.Scatter(x=hookload/1000.0, y=depth, mode="lines", name="Hookload"))
         fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
         fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))

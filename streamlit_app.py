@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
-Single-tab app: survey → casing/open-hole → T&D. Plots/behavior identical to prior version.
+One-tab app: survey → casing/open-hole → T&D. Now includes:
+- 2D Wellbore profile (TVD vs Vertical Section)
+- Drag profiles (Pickup/Slack-off/Rotating) with μ sweep overlays
 """
-
 from __future__ import annotations
 
 import math
@@ -15,12 +16,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ------------------------------ page ------------------------------
 st.set_page_config(page_title="Wellpath + Torque & Drag (Δs = 1 ft)", layout="wide")
 
-# ------------------------------ constants/helpers -----------------
-DEG2RAD: float = math.pi / 180.0
-IN2FT: float = 1.0 / 12.0
+# ------------------------------ constants/helpers ------------------------------
+DEG2RAD = math.pi / 180.0
+IN2FT = 1.0 / 12.0
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -31,30 +31,28 @@ def bf_from_mw(mw_ppg: float) -> float:
 def I_moment(od_in: float, id_in: float) -> float:
     return (math.pi / 64.0) * (od_in**4 - id_in**4)
 
-# ------------------------------ minimal casing/tool-joint DBs -----
-CASING_DB: Dict[str, Dict[str, Dict[float, float]]] = {
+# ------------------------------ minimal casing/tool-joint DBs ------------------
+CASING_DB = {
     "13-3/8": {"weights": {48.0: 12.415, 54.5: 12.347, 61.0: 12.107}},
-    "9-5/8":  {"weights": {29.3: 8.921, 36.0: 8.535, 40.0: 8.321}},
-    "7":      {"weights": {20.0: 6.366, 23.0: 6.059, 26.0: 5.920}},
-    "5-1/2":  {"weights": {17.0: 4.778, 20.0: 4.670, 23.0: 4.560}},
+    "9-5/8": {"weights": {29.3: 8.921, 36.0: 8.535, 40.0: 8.321}},
+    "7": {"weights": {20.0: 6.366, 23.0: 6.059, 26.0: 5.920}},
+    "5-1/2": {"weights": {17.0: 4.778, 20.0: 4.670, 23.0: 4.560}},
 }
-TOOL_JOINT_DB: Dict[str, Dict[str, float]] = {
+TOOL_JOINT_DB = {
     "NC38": {"od": 4.75, "id": 2.25, "T_makeup_ftlbf": 12000, "F_tensile_lbf": 350000, "T_yield_ftlbf": 20000},
     "NC40": {"od": 5.00, "id": 2.25, "T_makeup_ftlbf": 16000, "F_tensile_lbf": 420000, "T_yield_ftlbf": 25000},
     "NC50": {"od": 6.63, "id": 3.00, "T_makeup_ftlbf": 30000, "F_tensile_lbf": 650000, "T_yield_ftlbf": 45000},
 }
 
-# ------------------------------ survey builders -------------------
-def synth_build_hold(kop_md: float, build_rate_deg_per_100ft: float,
-                     theta_hold_deg: float, target_md: float, az_deg: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+# ------------------------------ survey builders --------------------------------
+def synth_build_hold(kop_md, build_rate_deg_per_100ft, theta_hold_deg, target_md, az_deg):
     ds = 1.0
     md = np.arange(0.0, target_md + ds, ds)
     theta = np.minimum(theta_hold_deg, np.maximum(0.0, md - kop_md) * (build_rate_deg_per_100ft / 100.0))
     az = np.full_like(md, az_deg, dtype=float)
     return md, theta, az
 
-def synth_build_hold_drop(kop_md: float, build_rate: float, theta_hold_deg: float,
-                          drop_rate: float, target_md: float, az_deg: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def synth_build_hold_drop(kop_md, build_rate, theta_hold_deg, drop_rate, target_md, az_deg):
     ds = 1.0
     md = np.arange(0.0, target_md + ds, ds)
     br = build_rate / 100.0
@@ -65,8 +63,7 @@ def synth_build_hold_drop(kop_md: float, build_rate: float, theta_hold_deg: floa
     az = np.full_like(md, az_deg, dtype=float)
     return md, theta, az
 
-def synth_horizontal(kop_md: float, build_rate: float, lateral_length: float,
-                     target_md: float, az_deg: float, theta_max: float = 90.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def synth_horizontal(kop_md, build_rate, lateral_length, target_md, az_deg, theta_max=90.0):
     ds = 1.0
     md = np.arange(0.0, target_md + ds, ds)
     br = build_rate / 100.0
@@ -80,16 +77,13 @@ def synth_horizontal(kop_md: float, build_rate: float, lateral_length: float,
     az = np.full_like(md, az_deg, dtype=float)
     return md, theta, az
 
-def mincurv_positions(md: Iterable[float], inc_deg: Iterable[float], az_deg: Iterable[float]):
-    md = np.asarray(md, dtype=float)
-    inc_deg = np.asarray(inc_deg, dtype=float)
-    az_deg = np.asarray(az_deg, dtype=float)
+def mincurv_positions(md, inc_deg, az_deg):
     ds = np.diff(md)
     n = len(md)
     N = np.zeros(n); E = np.zeros(n); TVD = np.zeros(n); DLS = np.zeros(n)
     for i in range(1, n):
-        I1 = inc_deg[i-1] * DEG2RAD; A1 = az_deg[i-1] * DEG2RAD
-        I2 = inc_deg[i]   * DEG2RAD; A2 = az_deg[i]   * DEG2RAD
+        I1 = inc_deg[i-1]*DEG2RAD; A1 = az_deg[i-1]*DEG2RAD
+        I2 = inc_deg[i]*DEG2RAD;   A2 = az_deg[i]*DEG2RAD
         dmd = ds[i-1]
         cos_dl = clamp(math.cos(I1)*math.cos(I2) + math.sin(I1)*math.sin(I2)*math.cos(A2 - A1), -1.0, 1.0)
         dpsi = math.acos(cos_dl)
@@ -97,59 +91,54 @@ def mincurv_positions(md: Iterable[float], inc_deg: Iterable[float], az_deg: Ite
         dN = 0.5*dmd*(math.sin(I1)*math.cos(A1)+math.sin(I2)*math.cos(A2))*RF
         dE = 0.5*dmd*(math.sin(I1)*math.sin(A1)+math.sin(I2)*math.sin(A2))*RF
         dZ = 0.5*dmd*(math.cos(I1)+math.cos(I2))*RF
-        N[i] = N[i-1] + dN; E[i] = E[i-1] + dE; TVD[i] = TVD[i-1] + dZ
+        N[i] = N[i-1]+dN; E[i] = E[i-1]+dE; TVD[i] = TVD[i-1]+dZ
         DLS[i] = (dpsi/DEG2RAD)/dmd*100.0 if dmd>0 else 0.0
     return N, E, TVD, DLS
 
-# ------------------------------ soft-string (Johancsik) ---------------
-def soft_string_stepper(md: Iterable[float], inc_deg: Iterable[float], kappa_rad_per_ft: Iterable[float],
-                        cased_mask: Iterable[bool], comp_along_depth: Iterable[str],
-                        comp_props: Dict[str, Dict[str, float]],
-                        mu_slide_cased: float, mu_slide_open: float, mu_rot_cased: float, mu_rot_open: float,
-                        mw_ppg: float, scenario: str = "slackoff",
-                        WOB_lbf: float = 0.0, Mbit_ftlbf: float = 0.0):
+# ------------------------------ soft-string (Johancsik) ------------------------
+def soft_string_stepper(md, inc_deg, kappa_rad_per_ft, cased_mask,
+                        comp_along_depth, comp_props,
+                        mu_slide_cased, mu_slide_open, mu_rot_cased, mu_rot_open,
+                        mw_ppg, scenario="slackoff", WOB_lbf=0.0, Mbit_ftlbf=0.0):
     ds = 1.0
-    md = np.asarray(md, dtype=float)
-    inc_deg = np.asarray(inc_deg, dtype=float)
+    md = np.asarray(md); inc_deg = np.asarray(inc_deg)
     nseg = len(md) - 1
-    if nseg <= 0:
-        raise ValueError("Trajectory is empty.")
+    if nseg <= 0: raise ValueError("Trajectory is empty.")
     inc = np.deg2rad(inc_deg[:-1])
 
-    kappa_all = np.asarray(kappa_rad_per_ft, dtype=float)
+    kappa_all = np.asarray(kappa_rad_per_ft)
     kappa_seg = kappa_all[:-1] if len(kappa_all) == len(md) else kappa_all
-    if len(kappa_seg) != nseg:
-        kappa_seg = np.resize(kappa_seg, nseg)
+    if len(kappa_seg) != nseg: kappa_seg = np.resize(kappa_seg, nseg)
 
     r_eff_ft = np.zeros(nseg); w_air = np.zeros(nseg); w_b = np.zeros(nseg)
     mu_s = np.zeros(nseg); mu_r = np.zeros(nseg); BF = bf_from_mw(mw_ppg)
 
-    cased_seg = np.asarray(cased_mask, dtype=bool)[:nseg]
+    cased_seg = np.asarray(cased_mask)[:nseg]
     comp_arr = np.asarray(list(comp_along_depth))[:nseg]
 
     for i in range(nseg):
         comp = comp_arr[i]
-        od_in = float(comp_props[comp]["od_in"]); id_in = float(comp_props[comp]["id_in"]); w_air_ft = float(comp_props[comp]["w_air_lbft"])
-        w_air[i] = w_air_ft; w_b[i] = w_air_ft * BF
-        r_eff_ft[i] = 0.5 * od_in * IN2FT
+        od_in = float(comp_props[comp]['od_in']); id_in = float(comp_props[comp]['id_in']); w_air_ft = float(comp_props[comp]['w_air_lbft'])
+        w_air[i] = w_air_ft; w_b[i] = w_air_ft*BF
+        r_eff_ft[i] = 0.5*od_in*IN2FT
         if cased_seg[i]: mu_s[i] = mu_slide_cased; mu_r[i] = mu_rot_cased
         else:            mu_s[i] = mu_slide_open;  mu_r[i] = mu_rot_open
 
-    T = np.zeros(nseg + 1); M = np.zeros(nseg + 1)
-    dT = np.zeros(nseg); dM = np.zeros(nseg); N_side = np.zeros(nseg)
+    T = np.zeros(nseg+1); M = np.zeros(nseg+1)
+    dT = np.zeros(nseg);  dM = np.zeros(nseg);  N_side = np.zeros(nseg)
 
     if scenario == "onbottom":
-        T[0] = -float(WOB_lbf)  # why: impose WOB at bit for on-bottom
+        T[0] = -float(WOB_lbf)  # why: impose WOB at bit
         M[0] = float(Mbit_ftlbf)
 
     sgn_ax = {"pickup": +1.0, "slackoff": -1.0}.get(scenario, 0.0)
 
     for i in range(nseg):
-        N_side[i] = w_b[i] * math.sin(inc[i]) + T[i] * kappa_seg[i]
-        T_next = T[i] + (sgn_ax * w_b[i] * math.cos(inc[i]) + mu_s[i] * N_side[i]) * ds
-        M_next = M[i] + (mu_r[i] * N_side[i] * r_eff_ft[i]) * ds
-        dT[i] = T_next - T[i]; dM[i] = M_next - M[i]
-        T[i + 1] = T_next;     M[i + 1] = M_next
+        N_side[i] = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
+        T_next = T[i] + (sgn_ax*w_b[i]*math.cos(inc[i]) + mu_s[i]*N_side[i])*ds
+        M_next = M[i] + (mu_r[i]*N_side[i]*r_eff_ft[i])*ds
+        dT[i] = T_next - T[i];  dM[i] = M_next - M[i]
+        T[i+1] = T_next;        M[i+1] = M_next
 
     df = pd.DataFrame({
         "md_top_ft": md[:-1], "md_bot_ft": md[1:], "ds_ft": 1.0,
@@ -162,22 +151,21 @@ def soft_string_stepper(md: Iterable[float], inc_deg: Iterable[float], kappa_rad
     })
     return df, T, M
 
-# ------------------------------ API 7G envelope (surrogate) -------
-def api7g_envelope_points(F_lim: float, T_lim: float, n: int = 80) -> Tuple[np.ndarray, np.ndarray]:
+# ------------------------------ API 7G envelope (surrogate) --------------------
+def api7g_envelope_points(F_lim, T_lim, n=80):
     Fmax = max(float(F_lim), 1.0)
     F = np.linspace(0.0, Fmax, n)
-    T = float(T_lim) * np.sqrt(np.clip(1.0 - (F / Fmax) ** 2, 0.0, 1.0))
+    T = float(T_lim)*np.sqrt(np.clip(1.0 - (F/Fmax)**2, 0.0, 1.0))
     return F, T
 
-def Fs_sinusoidal(Epsi: float, Iin4: float, w_b_lbf_ft: np.ndarray, inc_deg: np.ndarray, clearance_ft: float) -> np.ndarray:
+def Fs_sinusoidal(Epsi, Iin4, w_b_lbf_ft, inc_deg, clearance_ft):
     theta = np.deg2rad(np.maximum(0.0, inc_deg))
     r = max(1e-6, clearance_ft)
-    return 2.0 * np.sqrt(Epsi * Iin4 * w_b_lbf_ft * np.sin(theta) / r)
+    return 2.0*np.sqrt(Epsi*Iin4 * w_b_lbf_ft*np.sin(theta)/r)
 
-def Fh_helical(Fs: np.ndarray) -> np.ndarray:
-    return 1.6 * Fs
+def Fh_helical(Fs): return 1.6*Fs
 
-# ------------------------------ UI: one tab ------------------------
+# ------------------------------ UI: one tab -----------------------------------
 (tab,) = st.tabs(["Wellpath + Torque & Drag (linked)"])
 with tab:
     # ---------- TRAJECTORY ----------
@@ -224,7 +212,7 @@ with tab:
     shoe_md = float(st.session_state['shoe_md'])
     cased_mask = md <= shoe_md
 
-    # ----------- 3D plot (flipped correctly: deeper is lower, positive TVD) -----------
+    # 3D path (correct orientation: deeper is lower)
     idx = int(np.searchsorted(md, shoe_md, side='right'))
     fig3d = go.Figure()
     if idx > 1:
@@ -233,21 +221,26 @@ with tab:
     if idx < len(md):
         fig3d.add_trace(go.Scatter3d(x=E[idx-1:], y=N[idx-1:], z=TVD[idx-1:],
                                      mode="lines", line=dict(width=4, color="#a97142"), name="Open-hole"))
-    fig3d.update_layout(
-        height=420,
-        scene=dict(
-            xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
-            zaxis=dict(autorange="reversed")  # why: make larger TVD plot lower
-        ),
-        legend=dict(orientation="h"),
-        margin=dict(l=10, r=10, t=10, b=10)
-    )
+    fig3d.update_layout(height=420, scene=dict(
+        xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
+        zaxis=dict(autorange="reversed")
+    ), legend=dict(orientation="h"), margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig3d, use_container_width=True)
+
+    # 2D Wellbore Profile (Required: TVD vs Vertical Section)
+    st.subheader("2D Wellbore Profile — TVD vs Vertical Section")
+    vs_ref = st.number_input("VS reference azimuth (deg)", 0.0, 360.0, float(az[0] if len(az) else az_deg), 1.0)
+    vs_ref_rad = vs_ref * DEG2RAD
+    VS = N*np.cos(vs_ref_rad) + E*np.sin(vs_ref_rad)  # projection on reference azimuth
+    fig2d = go.Figure(go.Scatter(x=VS, y=TVD, mode="lines", name="Wellbore"))
+    fig2d.update_layout(xaxis_title="Vertical Section (ft)", yaxis_title="TVD (ft)",
+                        yaxis=dict(autorange="reversed"), height=360, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig2d, use_container_width=True)
 
     st.dataframe(pd.DataFrame({
         "MD (ft)": md[:11], "Inc (deg)": inc_deg[:11], "Az (deg)": az[:11],
         "TVD (ft)": TVD[:11], "North (ft)": N[:11], "East (ft)": E[:11],
-        "DLS (deg/100 ft)": DLS[:11]
+        "VS (ft)": VS[:11], "DLS (deg/100 ft)": DLS[:11]
     }), use_container_width=True)
 
     # ---------- T&D ----------
@@ -279,6 +272,7 @@ with tab:
     hwdp_w = w2.number_input("HWDP weight (air, lb/ft)",  5.0,  40.0, 16.0, 0.1)
     dp_w   = w3.number_input("DP weight (air, lb/ft)",    8.0,  40.0, 19.5, 0.1)
 
+    # map string along depth
     nseg = len(md) - 1
     comp_along = np.empty(nseg, dtype=object)
     for i in range(nseg):
@@ -293,9 +287,10 @@ with tab:
         "DP":   {"od_in": dp_od,   "id_in": dp_id,   "w_air_lbft": dp_w},
     }
 
+    # curvature from DLS
     kappa = (DLS*DEG2RAD)/100.0
 
-    # NOT checked by default as requested
+    # Not checked by default
     simple_mode = st.checkbox("Use classic simple view (hide safety overlays & μ-sweep)", value=False)
 
     scen = st.selectbox("Scenario", ["Slack-off (RIH)","Pickup (POOH)","Rotate off-bottom","Rotate on-bottom"])
@@ -335,18 +330,57 @@ with tab:
         rig_torque_lim = st.number_input("Top-drive torque limit (lbf-ft)", 10000, 150000, 60000, 1000)
         rig_pull_lim   = st.number_input("Rig max hookload (lbf)", 50000, 1500000, 500000, 5000)
 
-        mu_band = st.multiselect("μ sweep for off-bottom risk curves",
-                                 [0.15,0.20,0.25,0.30,0.35,0.40],
+        mu_band = st.multiselect("μ sweep (applied to all regions, slide+rot)", [0.15,0.20,0.25,0.30,0.35,0.40],
                                  default=[0.20,0.25,0.30,0.35])
 
         tj = TOOL_JOINT_DB[tj_name]
         T_makeup_sf = tj['T_makeup_ftlbf']/sf_joint
         T_yield_sf  = tj['T_yield_ftlbf']/sf_joint
-        F_tensile_sf= tj['F_tensile_lbf']/sf_tension  # pipe-body uses its own SF
+        F_tensile_sf= tj['F_tensile_lbf']/sf_tension  # body tension uses its own SF
 
         F_env, T_env = api7g_envelope_points(F_tensile_sf, T_yield_sf, n=100)
 
-        def run_td_off_bottom(mu: float) -> Tuple[np.ndarray, np.ndarray]:
+        def run_td(mu: float, scen_key: str):
+            df_tmp, _, _ = soft_string_stepper(
+                md, inc_deg, kappa, cased_mask, comp_along, comp_props,
+                mu, mu, mu, mu, mw_ppg, scenario=scen_key, WOB_lbf=0.0, Mbit_ftlbf=0.0
+            )
+            depth_ = df_tmp["md_bot_ft"].to_numpy()
+            hook_  = np.maximum(0.0, -df_tmp["T_next_lbf"].to_numpy())
+            tor_   = np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
+            return depth_, hook_, tor_
+
+        # ---- Drag profiles (Required: Pickup/Slack-off/Rotating vs MD for multiple μ)
+        st.markdown("### Drag Profiles — μ overlays")
+        cD1, cD2, cD3 = st.columns(3)
+        # Pickup
+        fig_pick = go.Figure()
+        for mu in mu_band:
+            d, h, _ = run_td(mu, "pickup")
+            fig_pick.add_trace(go.Scatter(x=d, y=h/1000.0, mode="lines", name=f"μ={mu:.2f}"))
+        fig_pick.update_layout(xaxis_title="MD (ft)", yaxis_title="Pickup Hookload (klbf)",
+                               height=360, legend=dict(orientation="h"), margin=dict(l=10,r=10,t=10,b=10))
+        # Slack-off
+        fig_slack = go.Figure()
+        for mu in mu_band:
+            d, h, _ = run_td(mu, "slackoff")
+            fig_slack.add_trace(go.Scatter(x=d, y=h/1000.0, mode="lines", name=f"μ={mu:.2f}"))
+        fig_slack.update_layout(xaxis_title="MD (ft)", yaxis_title="Slack-off Hookload (klbf)",
+                                height=360, legend=dict(orientation="h"), margin=dict(l=10,r=10,t=10,b=10))
+        # Rotating off-bottom
+        fig_rot = go.Figure()
+        for mu in mu_band:
+            d, h, _ = run_td(mu, "rotate_off")
+            fig_rot.add_trace(go.Scatter(x=d, y=h/1000.0, mode="lines", name=f"μ={mu:.2f}"))
+        fig_rot.update_layout(xaxis_title="MD (ft)", yaxis_title="Rotating Weight (klbf)",
+                              height=360, legend=dict(orientation="h"), margin=dict(l=10,r=10,t=10,b=10))
+
+        with cD1: st.plotly_chart(fig_pick, use_container_width=True)
+        with cD2: st.plotly_chart(fig_slack, use_container_width=True)
+        with cD3: st.plotly_chart(fig_rot, use_container_width=True)
+
+        # ---- Your existing risk/limits/T&D visuals
+        def run_td_off_bottom(mu):
             df_tmp, _, _ = soft_string_stepper(
                 md, inc_deg, kappa, cased_mask, comp_along, comp_props,
                 mu, mu, mu, mu, mw_ppg, scenario="rotate_off", WOB_lbf=0.0, Mbit_ftlbf=0.0
@@ -358,7 +392,7 @@ with tab:
             dmu, tmu = run_td_off_bottom(mu)
             fig_left.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines"))
         fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
-                           annotation_text="Make-up torque / SF", annotation_position="top")
+                           annotation_text="Make-up torque / SF")
         fig_left.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)")
         fig_left.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))

@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
-# PEGN 517 – Torque & Drag + “T&D Model Chart” safety overlays
-# Δs = 1 ft; Minimum Curvature; Johancsik soft-string with buoyancy
-# Sources: API RP 7G envelope (make-up-torque-then-tension), Johancsik soft-string,
-# minimum curvature equations with ratio factor, BF=(65.5−MW)/65.5,
-# sinusoidal/helical buckling thresholds (rule-of-thumb helical ≈1.6× sinusoidal).
-# See project README for citations.
+# PEGN 517 – Wellpath + Torque & Drag (Δs = 1 ft)
+# Classic simple view with optional “T&D Model Chart” safety overlays.
+#
+# Methods:
+# - Minimum curvature with ratio factor (survey positions, DLS).
+# - Johancsik soft-string: N ≈ w_b·sinθ + T·κ, axial & torsional increments integrated bit→surface.
+# - Buoyancy BF = (65.5 − MW)/65.5 (steel ≈ 65.5 ppg).
+# - API RP 7G-like tension–torque envelope overlay (ellipse surrogate) + make-up torque / SF.
+# References: Johancsik SPE-11380; API RP 7G addendum; minimum curvature technical notes.
+#
+# Notes:
+# This file is self-contained. Keep requirements.txt minimal:
+#   streamlit
+#   plotly
+#   pandas
+#   numpy
 
 import math
 import numpy as np
@@ -14,7 +24,7 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="Wellpath + Torque & Drag (Δs = 1 ft)", layout="wide")
 
-# ------------------------------ small constants/helpers ------------------------------
+# ------------------------------ constants/helpers ------------------------------
 IN2FT   = 1.0/12.0
 DEG2RAD = math.pi/180.0
 
@@ -27,12 +37,11 @@ def area_pipe(od_in, id_in):
 def I_moment(od_in, id_in):
     return (math.pi/64.0)*(od_in**4 - id_in**4)  # in^4
 
-# Buoyancy factor (steel 65.5 ppg). :contentReference[oaicite:5]{index=5}
+# Buoyancy factor for steel in mud (steel ≈ 65.5 ppg).
 def bf_from_mw(mw_ppg):
     return (65.5 - mw_ppg)/65.5
 
-# ------------------------------ minimal standards (IDs are standards only) -----------
-# (A compact set to keep UI tidy; extend as needed.)
+# ------------------------------ minimal standards (ID from standards only) ----
 CASING_DB = {
     "13-3/8": {
         "weights": { 48.0: 12.415, 54.5: 12.347, 61.0: 12.107 }, "grades": ["J55","K55","L80","P110"]
@@ -48,16 +57,15 @@ CASING_DB = {
     }
 }
 
-# Tool-joint mini-database (approximate; for overlays). Values can be extended.
+# Tool-joint mini-db for overlays (approximate; extend as needed).
 TOOL_JOINT_DB = {
     'NC38': {'od': 4.75, 'id': 2.25, 'T_makeup_ftlbf': 12000, 'F_tensile_lbf': 350000, 'T_yield_ftlbf': 20000},
     'NC40': {'od': 5.00, 'id': 2.25, 'T_makeup_ftlbf': 16000, 'F_tensile_lbf': 420000, 'T_yield_ftlbf': 25000},
     'NC50': {'od': 6.63, 'id': 3.00, 'T_makeup_ftlbf': 30000, 'F_tensile_lbf': 650000, 'T_yield_ftlbf': 45000},
 }
 
-# ------------------------------ survey builders (synthetic) --------------------------
+# ------------------------------ synthetic survey builders ----------------------
 def synth_build_hold(kop_md, build_rate_deg_per_100ft, theta_hold_deg, target_md, az_deg):
-    """Build at constant rate to theta_hold, then hold to target."""
     ds = 1.0
     md = np.arange(0, target_md + ds, ds)
     theta = np.zeros_like(md)
@@ -73,7 +81,6 @@ def synth_build_hold(kop_md, build_rate_deg_per_100ft, theta_hold_deg, target_md
     return md, theta, az
 
 def synth_build_hold_drop(kop_md, build_rate, theta_hold_deg, drop_rate, target_md, az_deg):
-    """Build to hold angle, hold for a while, then drop back to 0 by drop_rate if possible."""
     ds = 1.0
     md = np.arange(0, target_md + ds, ds)
     theta = np.zeros_like(md)
@@ -82,7 +89,6 @@ def synth_build_hold_drop(kop_md, build_rate, theta_hold_deg, drop_rate, target_
     brad = build_rate/100.0
     drad = drop_rate/100.0
 
-    # Build to hold
     for i, m in enumerate(md):
         if m < kop_md:
             theta[i] = 0.0
@@ -97,7 +103,6 @@ def synth_build_hold_drop(kop_md, build_rate, theta_hold_deg, drop_rate, target_
     return md, theta, az
 
 def synth_horizontal(kop_md, build_rate, lateral_length, target_md, az_deg, theta_max=90.0):
-    """Continuous build to near horizontal, then lateral (approx)."""
     ds = 1.0
     md = np.arange(0, target_md + ds, ds)
     theta = np.zeros_like(md)
@@ -110,23 +115,21 @@ def synth_horizontal(kop_md, build_rate, lateral_length, target_md, az_deg, thet
         else:
             theta[i] = min(theta_max, (m - kop_md)*brad)
 
-    # Ensure there is at least 'lateral_length' beyond reaching theta_max
+    # ensure lateral
     idx_h = np.where(theta >= theta_max - 1e-6)[0]
     if len(idx_h):
         m_h = md[idx_h[0]]
-        md_end = m_h + lateral_length
-        md_end = max(md_end, target_md)
+        md_end = max(m_h + lateral_length, target_md)
         md = np.arange(0, md_end + ds, ds)
         theta = np.where(md <= m_h, np.minimum(theta_max, np.maximum(0, (md - kop_md)*brad)), theta_max)
         az = np.full_like(md, az_deg, dtype=float)
     return md, theta, az
 
-# Minimum curvature increments & coordinates. :contentReference[oaicite:6]{index=6}
+# Minimum curvature positions + DLS (deg/100 ft)
 def mincurv_positions(md, inc_deg, az_deg):
     ds = np.diff(md)
     n = len(md)
-    N = np.zeros(n); E = np.zeros(n); TVD = np.zeros(n)
-    DLS = np.zeros(n)  # deg/100ft
+    N = np.zeros(n); E = np.zeros(n); TVD = np.zeros(n); DLS = np.zeros(n)
     for i in range(1, n):
         I1 = inc_deg[i-1]*DEG2RAD; A1 = az_deg[i-1]*DEG2RAD
         I2 = inc_deg[i]*DEG2RAD;   A2 = az_deg[i]*DEG2RAD
@@ -141,53 +144,80 @@ def mincurv_positions(md, inc_deg, az_deg):
         DLS[i] = (dpsi/DEG2RAD)/dmd*100.0 if dmd>0 else 0.0
     return N, E, TVD, DLS
 
-# ------------------------------ soft-string T&D (Johancsik) --------------------------
-# Normal force per unit length: N ≈ w_b*sinθ + T*κ; step bit→surface.
-# :contentReference[oaicite:7]{index=7}
+# ------------------------------ Johancsik soft-string (patched) ----------------------
 def soft_string_stepper(md, inc_deg, kappa_rad_per_ft, cased_mask,
-                        comp_along_depth, comp_props,  # mapping per depth: 'DC'/'HWDP'/'DP'
+                        comp_along_depth, comp_props,  # 'DC'/'HWDP'/'DP' per segment
                         mu_slide_cased, mu_slide_open, mu_rot_cased, mu_rot_open,
                         mw_ppg, scenario="slackoff", WOB_lbf=0.0, Mbit_ftlbf=0.0,
                         hole_od_in=8.5):
+    """
+    Johancsik soft-string, Δs = 1 ft. All per-segment arrays must be length nseg=len(md)-1.
+    """
     ds = 1.0
-    n = len(md)
-    # Effective radius = OD/2 (in→ft) of the component in hole contact.
-    r_eff_ft = np.zeros(n-1)
-    w_air = np.zeros(n-1)     # lb/ft
-    w_b   = np.zeros(n-1)     # buoyed
-    mu_s  = np.zeros(n-1)
-    mu_r  = np.zeros(n-1)
-    inc = inc_deg[:-1]*DEG2RAD
+    md = np.asarray(md)
+    inc_deg = np.asarray(inc_deg)
 
+    # --- per-segment curvature (kappa_seg) ---
+    kappa_arr = np.asarray(kappa_rad_per_ft)
+    if kappa_arr.shape[0] == md.shape[0]:
+        kappa_seg = kappa_arr[:-1]       # station → segment
+    else:
+        kappa_seg = kappa_arr            # already per-segment
+
+    nseg = md.shape[0] - 1
+    if nseg <= 0:
+        raise ValueError("Need at least two MD stations for T&D.")
+
+    # per-segment inclination (lower station)
+    inc = np.deg2rad(inc_deg[:-1])
+
+    # allocate per-segment arrays
+    r_eff_ft = np.zeros(nseg)
+    w_air = np.zeros(nseg)     # lb/ft (air)
+    w_b   = np.zeros(nseg)     # buoyed
+    mu_s  = np.zeros(nseg)
+    mu_r  = np.zeros(nseg)
+
+    # buoyancy
     BF = bf_from_mw(mw_ppg)
-    for i in range(n-1):
-        comp = comp_along_depth[i]
-        od_in = comp_props[comp]['od_in']; id_in = comp_props[comp]['id_in']; w_air_ft = comp_props[comp]['w_air_lbft']
+    BF_arr = np.full(nseg, BF, dtype=float)
+
+    # cased/open per segment
+    cased_seg = np.asarray(cased_mask)[:nseg]
+
+    # fill component/friction per segment
+    for i in range(nseg):
+        comp = comp_along_depth[i]                   # 'DC'/'HWDP'/'DP'
+        od_in = comp_props[comp]['od_in']
+        id_in = comp_props[comp]['id_in']
+        w_air_ft = comp_props[comp]['w_air_lbft']
         w_air[i] = w_air_ft
-        w_b[i]   = w_air_ft*BF
-        r_eff_ft[i] = 0.5*in2ft(od_in)
-        if cased_mask[i]:
+        w_b[i]   = w_air_ft * BF
+        r_eff_ft[i] = 0.5 * in2ft(od_in)
+        if cased_seg[i]:
             mu_s[i] = mu_slide_cased; mu_r[i] = mu_rot_cased
         else:
             mu_s[i] = mu_slide_open;  mu_r[i] = mu_rot_open
 
-    # integrate bit→surface
-    T = np.zeros(n)       # axial (lbf), sign convention: pulling positive up
-    M = np.zeros(n)       # torque (lbf-ft)
-    dT = np.zeros(n-1); dM = np.zeros(n-1)
-    N_side = np.zeros(n-1)
+    # integrate bit → surface
+    T = np.zeros(nseg+1)       # axial tension (lbf), index 0 at bit
+    M = np.zeros(nseg+1)       # torque (lbf-ft)
+    dT = np.zeros(nseg)
+    dM = np.zeros(nseg)
+    N_side = np.zeros(nseg)
 
-    # Boundary conditions
+    # boundary
     if scenario == "onbottom":
-        T[0] = -float(WOB_lbf)   # axial at bit
-        M[0] = float(Mbit_ftlbf) # bit torque
+        T[0] = -float(WOB_lbf)
+        M[0] = float(Mbit_ftlbf)
     else:
         T[0] = 0.0; M[0] = 0.0
 
+    # axial sign (+ pickup, − slackoff, 0 rotate)
     sgn_ax = +1.0 if scenario == "pickup" else -1.0 if scenario == "slackoff" else 0.0
 
-    for i in range(n-1):
-        N_side[i] = w_b[i]*math.sin(inc[i]) + T[i]*kappa_rad_per_ft[i]
+    for i in range(nseg):
+        N_side[i] = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
         # axial
         T_next = T[i] + (sgn_ax*w_b[i]*math.cos(inc[i]) + mu_s[i]*N_side[i])*ds
         dT[i] = T_next - T[i]
@@ -198,37 +228,45 @@ def soft_string_stepper(md, inc_deg, kappa_rad_per_ft, cased_mask,
         M[i+1] = M_next
 
     df = pd.DataFrame({
-        "md_top_ft": md[:-1], "md_bot_ft": md[1:], "ds_ft": 1.0,
-        "inc_deg": inc_deg[:-1], "kappa_rad_ft": kappa_rad_per_ft[:-1],
-        "w_air_lbft": w_air, "BF": BF, "w_b_lbft": w_b,
-        "mu_slide": mu_s, "mu_rot": mu_r,
-        "N_lbf": N_side, "dT_lbf": dT, "T_next_lbf": T[1:],
-        "r_eff_ft": r_eff_ft, "dM_lbf_ft": dM, "M_next_lbf_ft": M[1:],
-        "cased?": cased_mask[:-1],
-        "comp": comp_along_depth[:-1]
+        "md_top_ft": md[:-1],
+        "md_bot_ft": md[1:],
+        "ds_ft": np.full(nseg, 1.0),
+        "inc_deg": inc_deg[:-1],
+        "kappa_rad_ft": kappa_seg,
+        "w_air_lbft": w_air,
+        "BF": BF_arr,
+        "w_b_lbft": w_b,
+        "mu_slide": mu_s,
+        "mu_rot": mu_r,
+        "N_lbf": N_side,
+        "dT_lbf": dT,
+        "T_next_lbf": T[1:],
+        "r_eff_ft": r_eff_ft,
+        "dM_lbf_ft": dM,
+        "M_next_lbf_ft": M[1:],
+        "cased?": cased_seg,
+        "comp": np.asarray(comp_along_depth)[:nseg]
     })
     return df, T, M
 
-# ------------------------------ API 7G-like envelope (ellipse surrogate) -------------
-# (For app overlay; API RP 7G shows curves—this is a conservative, practical overlay.) :contentReference[oaicite:8]{index=8}
+# ------------------------------ API 7G envelope surrogate -----------------------
 def api7g_envelope_points(F_lim, T_lim, n=80):
-    F = np.linspace(0, F_lim, n)
-    T = T_lim*np.sqrt(np.clip(1.0 - (F/F_lim)**2, 0.0, 1.0))
+    F = np.linspace(0, max(F_lim, 1.0), n)
+    T = T_lim*np.sqrt(np.clip(1.0 - (F/ max(F_lim, 1.0))**2, 0.0, 1.0))
     return F, T
 
-# Buckling thresholds (sinusoidal & helical≈1.6×). :contentReference[oaicite:9]{index=9}
+# Buckling thresholds (rule-of-thumb helical ≈ 1.6× sinusoidal)
 def Fs_sinusoidal(Epsi, Iin4, w_b_lbf_ft, inc_deg, clearance_ft):
     theta = np.deg2rad(np.maximum(0.0, inc_deg))
     r = np.maximum(1e-6, clearance_ft)
     return 2.0*np.sqrt(Epsi*Iin4 * w_b_lbf_ft*np.sin(theta)/r)
 
-def Fh_helical(Fs):
-    return 1.6*Fs  # rule of thumb (literature trend). :contentReference[oaicite:10]{index=10}
+def Fh_helical(Fs): return 1.6*Fs
 
 # ------------------------------ UI ---------------------------------------------------
 st.title("Wellpath + Torque & Drag (Δs = 1 ft)")
 
-tab1, tab2 = st.tabs(["Trajectory & 3D schematic", "Torque & Drag + Safety"])
+tab1, tab2 = st.tabs(["Trajectory & 3D schematic", "Torque & Drag"])
 
 with tab1:
     st.subheader("Synthetic survey (Minimum Curvature)")
@@ -255,10 +293,9 @@ with tab1:
         md, inc_deg, az = synth_horizontal(kop_md, br, lateral, target_md, az_deg)
 
     N, E, TVD, DLS = mincurv_positions(md, inc_deg, az)
-    # 3D schematic (simple)
+
     fig3d = go.Figure(data=[go.Scatter3d(
-        x=E, y=N, z=-TVD, mode="lines", line=dict(width=6, color="#4cc9f0"),
-        name="Wellpath"
+        x=E, y=N, z=-TVD, mode="lines", line=dict(width=6, color="#4cc9f0"), name="Wellpath"
     )])
     fig3d.update_layout(height=520, scene=dict(
         xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
@@ -272,7 +309,7 @@ with tab1:
         "TVD (ft)": TVD, "North (ft)": N, "East (ft)": E, "DLS (deg/100 ft)": DLS
     })
     st.dataframe(survey_df.head(11), use_container_width=True)
-    st.caption("Minimum curvature positions with ratio factor and DLS. :contentReference[oaicite:11]{index=11}")
+    st.caption("Minimum curvature positions with ratio factor and DLS.")
 
 with tab2:
     st.subheader("Casing / Open-hole (simple mode)")
@@ -316,17 +353,20 @@ with tab2:
     dp_id  = p3.number_input("DP ID (in)", 1.5, 5.0, 4.28, 0.01)
     dp_w   = st.number_input("DP weight (air, lb/ft)", 10.0, 30.0, 19.5, 0.1)
 
-    # Save for other parts
+    # store a few for diagnostics
     st.session_state['dp_od_in'] = dp_od
     st.session_state['dp_id_in'] = dp_id
     st.session_state['hole_diam_in'] = hole_diam_in
 
-    # Compose per-depth component map (bit up)
-    total_len = dc_len + hwdp_len + dp_len
-    path_len  = float(md[-1])
-    if total_len < path_len:
-        st.warning("String shorter than TD — DP length auto-extended to TD.")
-        dp_len = max(dp_len, path_len - (dc_len + hwdp_len))
+    # Compose per-depth component map (bit up) — exactly nseg entries
+    nseg = len(md) - 1
+    comp_along = np.empty(nseg, dtype=object)
+    for i in range(nseg):
+        # distance up from bit to segment top
+        depth_from_bit = float(md[-1]) - md[i]
+        if depth_from_bit <= dc_len: comp_along[i] = "DC"
+        elif depth_from_bit <= dc_len + hwdp_len: comp_along[i] = "HWDP"
+        else: comp_along[i] = "DP"
 
     comp_props = {
         "DC":   {"od_in": dc_od,   "id_in": dc_id,   "w_air_lbft": dc_w},
@@ -334,54 +374,14 @@ with tab2:
         "DP":   {"od_in": dp_od,   "id_in": dp_id,   "w_air_lbft": dp_w},
     }
 
-    comp_along = np.empty(len(md)-1, dtype=object)
-    for i in range(len(md)-1):
-        depth_from_bit = float(md[-1]) - md[i]  # distance up from bit
-        if depth_from_bit <= dc_len: comp_along[i] = "DC"
-        elif depth_from_bit <= dc_len + hwdp_len: comp_along[i] = "HWDP"
-        else: comp_along[i] = "DP"
-
-    # Curvature per ft from DLS (deg/100 ft)
-    # we compute DLS on the fly via min-curv; convert to κ(rad/ft):
+    # curvature per ft from DLS
     _, _, _, DLS = mincurv_positions(md, inc_deg, az)
-    kappa = (DLS*DEG2RAD)/100.0  # rad/ft
+    kappa = (DLS*DEG2RAD)/100.0  # rad/ft (station-based)
 
-    # ------------------ Safety & limits (like the professor's slide) ------------------
-    st.subheader("Safety & limits")
-    s1, s2, s3 = st.columns(3)
-    tj_name = s1.selectbox("Tool-joint size", list(TOOL_JOINT_DB.keys()), index=2)
-    sf_joint = s2.number_input("Safety factor (tool-joint)", 1.00, 2.00, 1.10, 0.05)
-    sf_tension = s3.number_input("SF for pipe body tension", 1.00, 2.00, 1.15, 0.05)
+    # ------------------ Classic/simple toggle ------------------
+    simple_mode = st.checkbox("Use classic simple view (hide safety overlays & μ-sweep)", value=True)
 
-    rig_torque_lim = st.number_input("Top-drive torque limit (lbf-ft)", 10000, 150000, 60000, 1000)
-    rig_pull_lim   = st.number_input("Rig max hookload (lbf)", 50000, 1500000, 500000, 5000)
-
-    mu_band = st.multiselect("μ sweep for off-bottom risk curves", [0.15,0.20,0.25,0.30,0.35,0.40],
-                             default=[0.20,0.25,0.30,0.35])
-
-    tj = TOOL_JOINT_DB[tj_name]
-    T_makeup_sf = tj['T_makeup_ftlbf']/sf_joint
-    T_yield_sf  = tj['T_yield_ftlbf']/sf_joint
-    F_tensile_sf= tj['F_tensile_lbf']/sf_joint
-    F_env, T_env = api7g_envelope_points(F_tensile_sf, T_yield_sf, n=100)
-
-    # ------------------ Off-bottom μ-sweep (risk curves) ------------------
-    def run_td_off_bottom(mu):
-        df_tmp, T_tmp, M_tmp = soft_string_stepper(
-            md, inc_deg, kappa, cased_mask, comp_along, comp_props,
-            mu, mu, mu, mu, mw_ppg, scenario="rotate_off", WOB_lbf=0.0, Mbit_ftlbf=0.0,
-            hole_od_in=hole_diam_in
-        )
-        # Return total friction torque vs depth (surface torque at each depth index)
-        # cumulative from bit→that depth:
-        return np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
-
-    risk_traces = []
-    for mu in mu_band:
-        tor = run_td_off_bottom(mu)
-        risk_traces.append((mu, tor))
-
-    # ------------------ Main T&D run (choose scenario) ------------------
+    # ------------------ Main T&D run ------------------
     scen = st.selectbox("Scenario", ["Slack-off (RIH)","Pickup (POOH)","Rotate off-bottom","Rotate on-bottom"])
     if "Slack-off" in scen: scenario="slackoff"
     elif "Pickup" in scen:  scenario="pickup"
@@ -392,7 +392,7 @@ with tab2:
     mbit= st.number_input("Bit torque (lbf-ft) for on-bottom", 0.0, 50000.0, 0.0, 100.0)
 
     df_itr, T_arr, M_arr = soft_string_stepper(
-        md, inc_deg, kappa, cased_mask, comp_along, comp_props,
+        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
         mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
         mw_ppg, scenario=scenario, WOB_lbf=wob, Mbit_ftlbf=mbit, hole_od_in=hole_diam_in
     )
@@ -400,87 +400,128 @@ with tab2:
     depth = df_itr["md_bot_ft"].to_numpy()
     surf_hookload = max(0.0, -T_arr[-1])   # positive up
     surf_torque   = abs(M_arr[-1])
-
     st.success(f"Surface hookload: {surf_hookload:,.0f} lbf — Surface torque: {surf_torque:,.0f} lbf-ft")
 
-    # ------------------ Elemental torque ------------------
-    comp = df_itr['comp'].to_numpy()
-    dM   = df_itr['dM_lbf_ft'].to_numpy()
-    tor_dc   = np.cumsum(np.where(comp=='DC',   dM, 0.0))
-    tor_hwdp = np.cumsum(np.where(comp=='HWDP', dM, 0.0))
-    tor_dp   = np.cumsum(np.where(comp=='DP',   dM, 0.0))
-    tor_total= np.cumsum(dM)
-    # Hookload vs depth
-    hookload = np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())
+    # ------------------ Classic/simple plots ------------------
+    if simple_mode:
+        figT = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["M_next_lbf_ft"]),
+                                    mode="lines", name="Torque"))
+        figT.update_xaxes(title_text="MD (ft)"); figT.update_yaxes(title_text="Torque (lbf-ft)")
+        figH = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.maximum(0.0, -df_itr["T_next_lbf"]),
+                                    mode="lines", name="Hookload"))
+        figH.update_xaxes(title_text="MD (ft)"); figH.update_yaxes(title_text="Hookload (lbf)")
+        c1, c2 = st.columns(2)
+        with c1: st.plotly_chart(figT, use_container_width=True)
+        with c2: st.plotly_chart(figH, use_container_width=True)
 
-    # Buckling thresholds
-    Epsi = 30.0e6   # psi
-    Iin4 = I_moment(dp_od, dp_id)  # for DP (dominant)
-    rbore_ft = 0.5*in2ft(hole_diam_in); rpipe_ft = 0.5*in2ft(dp_od)
-    clearance_ft = max(1e-3, rbore_ft - rpipe_ft)
-    Fs = Fs_sinusoidal(Epsi, Iin4, df_itr['w_b_lbft'].to_numpy(), df_itr['inc_deg'].to_numpy(), clearance_ft)
-    Fh = Fh_helical(Fs)
+    # ------------------ Safety overlays (optional) ------------------
+    if not simple_mode:
+        st.subheader("Safety & limits")
+        s1, s2, s3 = st.columns(3)
+        tj_name = s1.selectbox("Tool-joint size", list(TOOL_JOINT_DB.keys()), index=2)
+        sf_joint = s2.number_input("Safety factor (tool-joint)", 1.00, 2.00, 1.10, 0.05)
+        sf_tension = s3.number_input("SF for pipe body tension", 1.00, 2.00, 1.15, 0.05)
 
-    # ------------------ Professor-style plots ------------------
+        rig_torque_lim = st.number_input("Top-drive torque limit (lbf-ft)", 10000, 150000, 60000, 1000)
+        rig_pull_lim   = st.number_input("Rig max hookload (lbf)", 50000, 1500000, 500000, 5000)
 
-    # Left: off-bottom risk curves (torque vs depth)
-    fig_left = go.Figure()
-    for mu, tor in risk_traces:
-        fig_left.add_trace(go.Scatter(x=tor/1000.0, y=depth, name=f"μ={mu:.2f}", mode="lines"))
-    fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
-                       annotation_text="Make-up torque / SF", annotation_position="top")
-    fig_left.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-    fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)")
-    fig_left.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
+        mu_band = st.multiselect("μ sweep for off-bottom risk curves",
+                                 [0.15,0.20,0.25,0.30,0.35,0.40],
+                                 default=[0.20,0.25,0.30,0.35])
 
-    # Right: elemental torque track + limits
-    fig_right = go.Figure()
-    fig_right.add_trace(go.Scatter(x=tor_dc/1000.0,   y=depth, name="DC",   mode="lines"))
-    fig_right.add_trace(go.Scatter(x=tor_hwdp/1000.0, y=depth, name="HWDP", mode="lines"))
-    fig_right.add_trace(go.Scatter(x=tor_dp/1000.0,   y=depth, name="DP",   mode="lines"))
-    fig_right.add_trace(go.Scatter(x=tor_total/1000.0,y=depth, name="Total", mode="lines", line=dict(width=3)))
-    fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
-    fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
-    fig_right.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-    fig_right.update_xaxes(title_text="Elemental torque (k lbf-ft)")
-    fig_right.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
+        tj = TOOL_JOINT_DB[tj_name]
+        T_makeup_sf = tj['T_makeup_ftlbf']/sf_joint
+        T_yield_sf  = tj['T_yield_ftlbf']/sf_joint
+        F_tensile_sf= tj['F_tensile_lbf']/sf_joint
+        F_env, T_env = api7g_envelope_points(F_tensile_sf, T_yield_sf, n=100)
 
-    st.markdown("### T&D Model Chart — Risk curves and limits")
-    cL, cR = st.columns(2)
-    with cL: st.plotly_chart(fig_left, use_container_width=True)
-    with cR: st.plotly_chart(fig_right, use_container_width=True)
+        # μ-sweep helper (depth & torque returned with matching lengths)
+        def run_td_off_bottom(mu):
+            df_tmp, T_tmp, M_tmp = soft_string_stepper(
+                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+                mu, mu, mu, mu, mw_ppg,
+                scenario="rotate_off", WOB_lbf=0.0, Mbit_ftlbf=0.0, hole_od_in=hole_diam_in
+            )
+            depth_mu = df_tmp["md_bot_ft"].to_numpy()
+            tor_mu   = np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
+            return depth_mu, tor_mu
 
-    # Envelope (API 7G-ish) and Hookload diagnostics
-    fig_env = go.Figure()
-    fig_env.add_trace(go.Scatter(x=T_env/1000.0, y=F_env/1000.0, mode="lines", name="API 7G envelope (approx)"))
-    fig_env.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
-    fig_env.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
-    fig_env.add_trace(go.Scatter(x=[abs(tor_total[-1])/1000.0], y=[hookload[-1]/1000.0], mode="markers",
-                                 name="Operating point", marker=dict(size=10, color="orange")))
-    fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
-    fig_env.update_yaxes(title_text="Tension (k lbf)")
-    fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
+        # Left panel: off-bottom μ-sweep risk curves (torque vs depth)
+        risk_traces = []
+        for mu in mu_band:
+            dmu, tmu = run_td_off_bottom(mu)
+            risk_traces.append((mu, dmu, tmu))
 
-    fig_hl = go.Figure()
-    fig_hl.add_trace(go.Scatter(x=hookload/1000.0, y=depth, mode="lines", name="Hookload"))
-    fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
-    fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))
-    fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh", line=dict(dash="dot")))
-    fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-    fig_hl.update_xaxes(title_text="Force / Hookload (k lbf)")
-    fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
+        fig_left = go.Figure()
+        for mu, dmu, tor in risk_traces:
+            fig_left.add_trace(go.Scatter(x=tor/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines"))
+        fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
+                           annotation_text="Make-up torque / SF", annotation_position="top")
+        fig_left.update_yaxes(autorange="reversed", title_text="Depth (ft)")
+        fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)")
+        fig_left.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
 
-    st.markdown("### Envelope & Hookload diagnostics")
-    c3, c4 = st.columns(2)
-    with c3: st.plotly_chart(fig_env, use_container_width=True)
-    with c4: st.plotly_chart(fig_hl,  use_container_width=True)
+        # Right panel: elemental torque + limits
+        comp = df_itr['comp'].to_numpy()
+        dM   = df_itr['dM_lbf_ft'].to_numpy()
+        tor_dc   = np.cumsum(np.where(comp=='DC',   dM, 0.0))
+        tor_hwdp = np.cumsum(np.where(comp=='HWDP', dM, 0.0))
+        tor_dp   = np.cumsum(np.where(comp=='DP',   dM, 0.0))
+        tor_total= np.cumsum(dM)
+        hookload = np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())
+
+        fig_right = go.Figure()
+        fig_right.add_trace(go.Scatter(x=tor_dc/1000.0,   y=depth, name="DC",   mode="lines"))
+        fig_right.add_trace(go.Scatter(x=tor_hwdp/1000.0, y=depth, name="HWDP", mode="lines"))
+        fig_right.add_trace(go.Scatter(x=tor_dp/1000.0,   y=depth, name="DP",   mode="lines"))
+        fig_right.add_trace(go.Scatter(x=tor_total/1000.0,y=depth, name="Total", mode="lines", line=dict(width=3)))
+        fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
+        fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
+        fig_right.update_yaxes(autorange="reversed", title_text="Depth (ft)")
+        fig_right.update_xaxes(title_text="Elemental torque (k lbf-ft)")
+        fig_right.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
+
+        st.markdown("### T&D Model Chart — Risk curves and limits")
+        cL, cR = st.columns(2)
+        with cL: st.plotly_chart(fig_left, use_container_width=True)
+        with cR: st.plotly_chart(fig_right, use_container_width=True)
+
+        # Envelope & hookload diagnostics (buckling)
+        Epsi = 30.0e6   # psi
+        Iin4 = I_moment(dp_od, dp_id)  # DP dominant
+        rbore_ft = 0.5*in2ft(hole_diam_in); rpipe_ft = 0.5*in2ft(dp_od)
+        clearance_ft = max(1e-3, rbore_ft - rpipe_ft)
+        Fs = Fs_sinusoidal(Epsi, Iin4, df_itr['w_b_lbft'].to_numpy(), df_itr['inc_deg'].to_numpy(), clearance_ft)
+        Fh = Fh_helical(Fs)
+
+        fig_env = go.Figure()
+        fig_env.add_trace(go.Scatter(x=(T_env)/1000.0, y=(F_env)/1000.0, mode="lines", name="API 7G envelope (approx)"))
+        fig_env.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
+        fig_env.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
+        fig_env.add_trace(go.Scatter(x=[abs(tor_total[-1])/1000.0], y=[hookload[-1]/1000.0], mode="markers",
+                                     name="Operating point", marker=dict(size=10, color="orange")))
+        fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
+        fig_env.update_yaxes(title_text="Tension (k lbf)")
+        fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
+
+        fig_hl = go.Figure()
+        fig_hl.add_trace(go.Scatter(x=hookload/1000.0, y=depth, mode="lines", name="Hookload"))
+        fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
+        fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))
+        fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh", line=dict(dash="dot")))
+        fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
+        fig_hl.update_xaxes(title_text="Force / Hookload (k lbf)")
+        fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
+
+        st.markdown("### Envelope & Hookload diagnostics")
+        c3, c4 = st.columns(2)
+        with c3: st.plotly_chart(fig_env, use_container_width=True)
+        with c4: st.plotly_chart(fig_hl,  use_container_width=True)
 
     st.markdown("### Iteration trace (first 12 rows)")
     st.dataframe(df_itr.head(12), use_container_width=True)
 
     st.caption(
         "Johancsik soft-string (sliding friction) with N ≈ w_b·sinθ + T·κ; Δs=1 ft; "
-        "BF=(65.5–MW)/65.5; API RP 7G envelope overlay (make-up torque then tension); "
-        "buckling thresholds from sinusoidal/helical trends. "
-        "Refs: Johancsik (SPE), API RP 7G, minimum curvature note. "
+        "BF=(65.5–MW)/65.5; API RP 7G envelope overlay (make-up torque then tension)."
     )

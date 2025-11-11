@@ -1,4 +1,5 @@
-streamlit
-plotly
+streamlit>=1.36
+plotly>=5.22
+kaleido==0.2.1
 numpy
 pandas

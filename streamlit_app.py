@@ -2,64 +2,49 @@
 # -*- coding: utf-8 -*-
 """
 PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
-One-tab app: survey → casing/open-hole → T&D.
-Key points:
-- 3D TVD orientation fixed.
-- 2D TVD–VS split by Shoe MD (Cased cyan, Open-hole brown).
-- Right plot: elemental torque vs depth (μ-sweep), Top-drive limit moved to left plot,
-  combined-load envelope added.
+Left plot unchanged (old style). Right plot updated.
 """
 
 from __future__ import annotations
-
 import math
 from typing import Dict, Iterable, Tuple
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ------------------------------ page ------------------------------
 st.set_page_config(page_title="Wellpath + Torque & Drag (Δs = 1 ft)", layout="wide")
 
-# ------------------------------ constants/helpers -----------------
+# ------------------------------ constants/helpers ------------------------------
 DEG2RAD = math.pi / 180.0
 IN2FT = 1.0 / 12.0
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+def clamp(x: float, lo: float, hi: float) -> float: return max(lo, min(hi, x))
+def bf_from_mw(mw_ppg: float) -> float: return (65.5 - mw_ppg) / 65.5  # steel ~65.5 ppg
+def I_moment(od_in: float, id_in: float) -> float: return (math.pi / 64.0) * (od_in**4 - id_in**4)
 
-def bf_from_mw(mw_ppg: float) -> float:
-    return (65.5 - mw_ppg) / 65.5  # steel ~65.5 ppg
-
-def I_moment(od_in: float, id_in: float) -> float:
-    return (math.pi / 64.0) * (od_in**4 - id_in**4)
-
-# ------------------------------ minimal casing/tool-joint DBs -----
-CASING_DB: Dict[str, Dict[str, Dict[float, float]]] = {
+# ------------------------------ minimal casing/tool-joint DBs ------------------
+CASING_DB = {
     "13-3/8": {"weights": {48.0: 12.415, 54.5: 12.347, 61.0: 12.107}},
     "9-5/8":  {"weights": {29.3: 8.921, 36.0: 8.535, 40.0: 8.321}},
     "7":      {"weights": {20.0: 6.366, 23.0: 6.059, 26.0: 5.920}},
     "5-1/2":  {"weights": {17.0: 4.778, 20.0: 4.670, 23.0: 4.560}},
 }
-TOOL_JOINT_DB: Dict[str, Dict[str, float]] = {
+TOOL_JOINT_DB = {
     "NC38": {"od": 4.75, "id": 2.25, "T_makeup_ftlbf": 12000, "F_tensile_lbf": 350000, "T_yield_ftlbf": 20000},
     "NC40": {"od": 5.00, "id": 2.25, "T_makeup_ftlbf": 16000, "F_tensile_lbf": 420000, "T_yield_ftlbf": 25000},
     "NC50": {"od": 6.63, "id": 3.00, "T_makeup_ftlbf": 30000, "F_tensile_lbf": 650000, "T_yield_ftlbf": 45000},
 }
 
-# ------------------------------ survey builders -------------------
-def synth_build_hold(kop_md: float, build_rate_deg_per_100ft: float,
-                     theta_hold_deg: float, target_md: float, az_deg: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+# ------------------------------ survey builders --------------------------------
+def synth_build_hold(kop_md, build_rate_deg_per_100ft, theta_hold_deg, target_md, az_deg):
     ds = 1.0
     md = np.arange(0.0, target_md + ds, ds)
     theta = np.minimum(theta_hold_deg, np.maximum(0.0, md - kop_md) * (build_rate_deg_per_100ft / 100.0))
     az = np.full_like(md, az_deg, dtype=float)
     return md, theta, az
 
-def synth_build_hold_drop(kop_md: float, build_rate: float, theta_hold_deg: float,
-                          drop_rate: float, target_md: float, az_deg: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def synth_build_hold_drop(kop_md, build_rate, theta_hold_deg, drop_rate, target_md, az_deg):
     ds = 1.0
     md = np.arange(0.0, target_md + ds, ds)
     br = build_rate / 100.0
@@ -70,8 +55,7 @@ def synth_build_hold_drop(kop_md: float, build_rate: float, theta_hold_deg: floa
     az = np.full_like(md, az_deg, dtype=float)
     return md, theta, az
 
-def synth_horizontal(kop_md: float, build_rate: float, lateral_length: float,
-                     target_md: float, az_deg: float, theta_max: float = 90.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def synth_horizontal(kop_md, build_rate, lateral_length, target_md, az_deg, theta_max=90.0):
     ds = 1.0
     md = np.arange(0.0, target_md + ds, ds)
     br = build_rate / 100.0
@@ -85,10 +69,7 @@ def synth_horizontal(kop_md: float, build_rate: float, lateral_length: float,
     az = np.full_like(md, az_deg, dtype=float)
     return md, theta, az
 
-def mincurv_positions(md: Iterable[float], inc_deg: Iterable[float], az_deg: Iterable[float]):
-    md = np.asarray(md, dtype=float)
-    inc_deg = np.asarray(inc_deg, dtype=float)
-    az_deg = np.asarray(az_deg, dtype=float)
+def mincurv_positions(md, inc_deg, az_deg):
     ds = np.diff(md)
     n = len(md)
     N = np.zeros(n); E = np.zeros(n); TVD = np.zeros(n); DLS = np.zeros(n)
@@ -102,59 +83,54 @@ def mincurv_positions(md: Iterable[float], inc_deg: Iterable[float], az_deg: Ite
         dN = 0.5*dmd*(math.sin(I1)*math.cos(A1)+math.sin(I2)*math.cos(A2))*RF
         dE = 0.5*dmd*(math.sin(I1)*math.sin(A1)+math.sin(I2)*math.sin(A2))*RF
         dZ = 0.5*dmd*(math.cos(I1)+math.cos(I2))*RF
-        N[i] = N[i-1] + dN; E[i] = E[i-1] + dE; TVD[i] = TVD[i-1] + dZ
+        N[i] = N[i-1]+dN; E[i] = E[i-1]+dE; TVD[i] = TVD[i-1]+dZ
         DLS[i] = (dpsi/DEG2RAD)/dmd*100.0 if dmd>0 else 0.0
     return N, E, TVD, DLS
 
-# ------------------------------ soft-string (Johancsik) ---------------
-def soft_string_stepper(md: Iterable[float], inc_deg: Iterable[float], kappa_rad_per_ft: Iterable[float],
-                        cased_mask: Iterable[bool], comp_along_depth: Iterable[str],
-                        comp_props: Dict[str, Dict[str, float]],
-                        mu_slide_cased: float, mu_slide_open: float, mu_rot_cased: float, mu_rot_open: float,
-                        mw_ppg: float, scenario: str = "slackoff",
-                        WOB_lbf: float = 0.0, Mbit_ftlbf: float = 0.0):
+# ------------------------------ soft-string (Johancsik) ------------------------
+def soft_string_stepper(md, inc_deg, kappa_rad_per_ft, cased_mask,
+                        comp_along_depth, comp_props,
+                        mu_slide_cased, mu_slide_open, mu_rot_cased, mu_rot_open,
+                        mw_ppg, scenario="slackoff", WOB_lbf=0.0, Mbit_ftlbf=0.0):
     ds = 1.0
-    md = np.asarray(md, dtype=float)
-    inc_deg = np.asarray(inc_deg, dtype=float)
+    md = np.asarray(md); inc_deg = np.asarray(inc_deg)
     nseg = len(md) - 1
-    if nseg <= 0:
-        raise ValueError("Trajectory is empty.")
+    if nseg <= 0: raise ValueError("Trajectory is empty.")
     inc = np.deg2rad(inc_deg[:-1])
 
-    kappa_all = np.asarray(kappa_rad_per_ft, dtype=float)
+    kappa_all = np.asarray(kappa_rad_per_ft)
     kappa_seg = kappa_all[:-1] if len(kappa_all) == len(md) else kappa_all
-    if len(kappa_seg) != nseg:
-        kappa_seg = np.resize(kappa_seg, nseg)
+    if len(kappa_seg) != nseg: kappa_seg = np.resize(kappa_seg, nseg)
 
     r_eff_ft = np.zeros(nseg); w_air = np.zeros(nseg); w_b = np.zeros(nseg)
     mu_s = np.zeros(nseg); mu_r = np.zeros(nseg); BF = bf_from_mw(mw_ppg)
 
-    cased_seg = np.asarray(cased_mask, dtype=bool)[:nseg]
+    cased_seg = np.asarray(cased_mask)[:nseg]
     comp_arr = np.asarray(list(comp_along_depth))[:nseg]
 
     for i in range(nseg):
         comp = comp_arr[i]
-        od_in = float(comp_props[comp]["od_in"]); id_in = float(comp_props[comp]["id_in"]); w_air_ft = float(comp_props[comp]["w_air_lbft"])
-        w_air[i] = w_air_ft; w_b[i] = w_air_ft * BF
-        r_eff_ft[i] = 0.5 * od_in * IN2FT
+        od_in = float(comp_props[comp]['od_in']); id_in = float(comp_props[comp]['id_in']); w_air_ft = float(comp_props[comp]['w_air_lbft'])
+        w_air[i] = w_air_ft; w_b[i] = w_air_ft*BF
+        r_eff_ft[i] = 0.5*od_in*IN2FT
         if cased_seg[i]: mu_s[i] = mu_slide_cased; mu_r[i] = mu_rot_cased
         else:            mu_s[i] = mu_slide_open;  mu_r[i] = mu_rot_open
 
-    T = np.zeros(nseg + 1); M = np.zeros(nseg + 1)
-    dT = np.zeros(nseg); dM = np.zeros(nseg); N_side = np.zeros(nseg)
+    T = np.zeros(nseg+1); M = np.zeros(nseg+1)
+    dT = np.zeros(nseg);  dM = np.zeros(nseg);  N_side = np.zeros(nseg)
 
     if scenario == "onbottom":
-        T[0] = -float(WOB_lbf)  # why: impose WOB at bit for on-bottom
+        T[0] = -float(WOB_lbf)  # why: impose WOB at bit
         M[0] = float(Mbit_ftlbf)
 
     sgn_ax = {"pickup": +1.0, "slackoff": -1.0}.get(scenario, 0.0)
 
     for i in range(nseg):
-        N_side[i] = w_b[i] * math.sin(inc[i]) + T[i] * kappa_seg[i]
-        T_next = T[i] + (sgn_ax * w_b[i] * math.cos(inc[i]) + mu_s[i] * N_side[i]) * ds
-        M_next = M[i] + (mu_r[i] * N_side[i] * r_eff_ft[i]) * ds
-        dT[i] = T_next - T[i]; dM[i] = M_next - M[i]
-        T[i + 1] = T_next;     M[i + 1] = M_next
+        N_side[i] = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
+        T_next = T[i] + (sgn_ax*w_b[i]*math.cos(inc[i]) + mu_s[i]*N_side[i])*ds
+        M_next = M[i] + (mu_r[i]*N_side[i]*r_eff_ft[i])*ds
+        dT[i] = T_next - T[i];  dM[i] = M_next - M[i]
+        T[i+1] = T_next;        M[i+1] = M_next
 
     df = pd.DataFrame({
         "md_top_ft": md[:-1], "md_bot_ft": md[1:], "ds_ft": 1.0,
@@ -167,23 +143,23 @@ def soft_string_stepper(md: Iterable[float], inc_deg: Iterable[float], kappa_rad
     })
     return df, T, M
 
-# ------------------------------ API 7G envelope (surrogate) -------
-def api7g_envelope_points(F_lim: float, T_lim: float, n: int = 80) -> Tuple[np.ndarray, np.ndarray]:
+# ------------------------------ API 7G envelope (surrogate) --------------------
+def api7g_envelope_points(F_lim, T_lim, n=80):
     Fmax = max(float(F_lim), 1.0)
     F = np.linspace(0.0, Fmax, n)
-    T = float(T_lim) * np.sqrt(np.clip(1.0 - (F / Fmax) ** 2, 0.0, 1.0))
+    T = float(T_lim)*np.sqrt(np.clip(1.0 - (F/Fmax)**2, 0.0, 1.0))
     return F, T
 
-def Fs_sinusoidal(Epsi: float, Iin4: float, w_b_lbf_ft: np.ndarray, inc_deg: np.ndarray, clearance_ft: float) -> np.ndarray:
+def Fs_sinusoidal(Epsi, Iin4, w_b_lbf_ft, inc_deg, clearance_ft):
     theta = np.deg2rad(np.maximum(0.0, inc_deg))
     r = max(1e-6, clearance_ft)
-    return 2.0 * np.sqrt(Epsi * Iin4 * w_b_lbf_ft * np.sin(theta) / r)
+    return 2.0*np.sqrt(Epsi*Iin4 * w_b_lbf_ft*np.sin(theta)/r)
 
-def Fh_helical(Fs: np.ndarray) -> np.ndarray:
-    return 1.6 * Fs
+def Fh_helical(Fs): return 1.6*Fs
 
-# ------------------------------ UI: one tab ------------------------
+# ------------------------------ UI: one tab -----------------------------------
 (tab,) = st.tabs(["Wellpath + Torque & Drag (linked)"])
+
 with tab:
     # ---------- TRAJECTORY ----------
     st.subheader("Trajectory & 3D schematic (Minimum Curvature)")
@@ -229,7 +205,7 @@ with tab:
     shoe_md = float(st.session_state['shoe_md'])
     cased_mask = md <= shoe_md
 
-    # ----------- 3D plot (deeper lower; positive TVD) -----------
+    # 3D split by shoe
     idx = int(np.searchsorted(md, shoe_md, side='right'))
     fig3d = go.Figure()
     if idx > 1:
@@ -244,7 +220,7 @@ with tab:
     ), legend=dict(orientation="h"), margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig3d, use_container_width=True)
 
-    # ----------- 2D TVD–VS split by Shoe MD -----------
+    # 2D TVD–VS split by Shoe MD
     st.subheader("2D Wellbore Profile — TVD vs Vertical Section")
     vs_ref = st.number_input("VS reference azimuth (deg)", 0.0, 360.0, float(az[0] if len(az) else az_deg), 1.0)
     VS = N*np.cos(vs_ref*DEG2RAD) + E*np.sin(vs_ref*DEG2RAD)
@@ -297,7 +273,7 @@ with tab:
     hwdp_w = w2.number_input("HWDP weight (air, lb/ft)",  5.0,  40.0, 16.0, 0.1)
     dp_w   = w3.number_input("DP weight (air, lb/ft)",    8.0,  40.0, 19.5, 0.1)
 
-    # map string along depth (from surface down)
+    # map string along depth
     nseg = len(md) - 1
     comp_along = np.empty(nseg, dtype=object)
     for i in range(nseg):
@@ -328,9 +304,7 @@ with tab:
     )
 
     depth = df_itr["md_bot_ft"].to_numpy()
-    hookload_profile = np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())
-    surf_hookload = max(0.0, -T_arr[-1])
-    surf_torque = abs(M_arr[-1])
+    surf_hookload = max(0.0, -T_arr[-1]); surf_torque = abs(M_arr[-1])
     st.success(f"Surface hookload: {surf_hookload:,.0f} lbf — Surface torque: {surf_torque:,.0f} lbf-ft")
 
     if simple_mode:
@@ -359,62 +333,61 @@ with tab:
                                  default=[0.20,0.25,0.30,0.35])
 
         tj = TOOL_JOINT_DB[tj_name]
-        T_makeup_sf   = tj['T_makeup_ftlbf'] / sf_joint
-        T_yield_sf    = tj['T_yield_ftlbf']  / sf_joint
-        F_tensile_sf  = tj['F_tensile_lbf']  / sf_tension  # body tension uses its own SF
+        T_makeup_sf   = tj['T_makeup_ftlbf']/sf_joint
+        T_yield_sf    = tj['T_yield_ftlbf']/sf_joint
+        F_tensile_sf  = tj['F_tensile_lbf']/sf_tension
 
         def run_td_off_bottom(mu: float):
             df_tmp, _, _ = soft_string_stepper(
                 md, inc_deg, kappa, cased_mask, comp_along, comp_props,
                 mu, mu, mu, mu, mw_ppg, scenario="rotate_off", WOB_lbf=0.0, Mbit_ftlbf=0.0
             )
-            d_ = df_tmp["md_bot_ft"].to_numpy()
-            t_ = np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
-            # ensure highest at surface on the elemental curve
-            if t_[0] < t_[-1]:
-                t_ = t_[::-1]
-            return d_, t_
+            return df_tmp["md_bot_ft"].to_numpy(), np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
 
-        # ---------- LEFT PLOT (μ-sweep off-bottom surface torque vs depth) ----------
+        # ---------- LEFT PLOT (REVERTED: old behavior) ----------
         fig_left = go.Figure()
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu)
             fig_left.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines"))
         fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
                            annotation_text="Make-up torque / SF")
-        fig_left.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot",
-                           annotation_text="Top-drive limit")  # surface limit belongs here
+        # NOTE: Top-drive limit intentionally NOT shown on the left (old spec)
         fig_left.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-        fig_left.update_xaxes(title_text="Off-bottom surface torque (k lbf-ft)")
+        fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)")
         fig_left.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
 
-        # ---------- RIGHT PLOT (Elemental torque vs depth; μ-sweep) ----------
+        # ---------- RIGHT PLOT (UPDATED ONLY) ----------
         fig_right = go.Figure()
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu)
+            # ensure highest at surface for elemental curve
+            if tmu[0] < tmu[-1]:
+                tmu = tmu[::-1]
             fig_right.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines"))
+
         # Section bands/labels (depth from surface)
         dp_top, dp_bot = 0.0, dp_len
         hwdp_top, hwdp_bot = dp_bot, dp_bot + hwdp_len
         dc_top, dc_bot = hwdp_bot, hwdp_bot + dc_len
-        fig_right.add_hrect(y0=dp_top, y1=dp_bot, line_width=0,
-                            annotation_text="DP", annotation_position="top left", opacity=0.0)
-        fig_right.add_hrect(y0=hwdp_top, y1=hwdp_bot, line_width=0,
-                            annotation_text="HWDP", annotation_position="top left", opacity=0.0)
-        fig_right.add_hrect(y0=dc_top, y1=dc_bot, line_width=0,
-                            annotation_text="DC", annotation_position="top left", opacity=0.0)
-        # Make-up limit
-        fig_right.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
-                            annotation_text="Make-up / SF")
+        fig_right.add_hrect(y0=dp_top, y1=dp_bot, line_width=0, annotation_text="DP",
+                            annotation_position="top left", opacity=0.0)
+        fig_right.add_hrect(y0=hwdp_top, y1=hwdp_bot, line_width=0, annotation_text="HWDP",
+                            annotation_position="top left", opacity=0.0)
+        fig_right.add_hrect(y0=dc_top, y1=dc_bot, line_width=0, annotation_text="DC",
+                            annotation_position="top left", opacity=0.0)
 
-        # Combined-load envelope using pickup axial tension (conservative)
+        # Limits on right
+        fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
+        fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
+
+        # Combined-load envelope (pickup tension)
         df_pick, _, _ = soft_string_stepper(
             md, inc_deg, kappa, cased_mask, comp_along, comp_props,
             mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
             mw_ppg, scenario="pickup", WOB_lbf=0.0, Mbit_ftlbf=0.0
         )
         depth_pick = df_pick["md_bot_ft"].to_numpy()
-        F_ax = np.maximum(0.0, df_pick["T_next_lbf"].to_numpy())  # tension only
+        F_ax = np.maximum(0.0, df_pick["T_next_lbf"].to_numpy())
         T_allow = T_yield_sf * np.sqrt(np.clip(1.0 - (F_ax / np.maximum(F_tensile_sf, 1.0))**2, 0.0, 1.0))
         fig_right.add_trace(go.Scatter(x=T_allow/1000.0, y=depth_pick, mode="lines",
                                        name="TJ combined-load limit", line=dict(dash="dot")))
@@ -437,18 +410,19 @@ with tab:
         Fh = Fh_helical(Fs)
 
         F_env, T_env = api7g_envelope_points(F_tensile_sf, T_yield_sf, n=100)
+        hookload = np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())
 
         fig_env = go.Figure()
         fig_env.add_trace(go.Scatter(x=(T_env)/1000.0, y=(F_env)/1000.0, mode="lines", name="API 7G envelope (approx)"))
         fig_env.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
-        fig_env.add_trace(go.Scatter(x=[surf_torque/1000.0], y=[hookload_profile[-1]/1000.0], mode="markers",
-                                     name="Operating point", marker=dict(size=10)))
+        fig_env.add_trace(go.Scatter(x=[abs(df_itr['M_next_lbf_ft'].to_numpy()[-1])/1000.0], y=[hookload[-1]/1000.0],
+                                     mode="markers", name="Operating point", marker=dict(size=10)))
         fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
         fig_env.update_yaxes(title_text="Tension (k lbf)")
         fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
 
         fig_hl = go.Figure()
-        fig_hl.add_trace(go.Scatter(x=hookload_profile/1000.0, y=depth, mode="lines", name="Hookload"))
+        fig_hl.add_trace(go.Scatter(x=hookload/1000.0, y=depth, mode="lines", name="Hookload"))
         fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
         fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))
         fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh", line=dict(dash="dot")))

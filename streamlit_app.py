@@ -2,15 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
-Linked, single-tab workflow with survey import, calibration, μ-sweep risk curves,
-0.8×MU gate, TJ combined-load envelope, buckling indicators, NP check, motor torque,
-and rig-limit margins. Rotating off-bottom HL = average(PU, SO) per standard practice.
+Linked workflow with calibration, NP, 0.8×MU, BSR/SR, tortuosity, motor-BT,
+rig-limit margins, hole-cleaning booster, and calibrated μ overlay (dashed).
 
 Libraries: streamlit, plotly, numpy, pandas
 """
 
 from __future__ import annotations
-import io
 import math
 from typing import Dict, Iterable, Tuple, List, Optional
 
@@ -25,26 +23,24 @@ st.set_page_config(page_title="Wellpath + Torque & Drag (Δs = 1 ft)", layout="w
 # ─────────────────────────── Constants ──────────────────────────
 DEG2RAD = math.pi / 180.0
 IN2FT   = 1.0/12.0
+E_STEEL_PSI = 30.0e6  # used in buckling Fs/Fh estimate
 
 def clamp(x: float, lo: float, hi: float) -> float: return max(lo, min(hi, x))
 def bf_from_mw(mw_ppg: float) -> float: return (65.5 - mw_ppg)/65.5  # steel ~65.5 ppg
 def I_in4(od_in: float, id_in: float) -> float: return (math.pi/64.0)*(od_in**4 - id_in**4)
 def Z_in3(od_in: float, id_in: float) -> float: return I_in4(od_in, id_in) / (od_in/2.0)
 
-# Minimal dimensional DBs (extend as needed)
+# ────────────────────── Minimal standards DBs ───────────────────
 CASING_DB = {
     "13-3/8": {"weights": {48.0: 12.415, 54.5: 12.347, 61.0: 12.107}},
     "9-5/8":  {"weights": {29.3: 8.921, 36.0: 8.535, 40.0: 8.321}},
     "7":      {"weights": {20.0: 6.366, 23.0: 6.059, 26.0: 5.920}},
     "5-1/2":  {"weights": {17.0: 4.778, 20.0: 4.670, 23.0: 4.560}},
 }
+
 TOOL_JOINT_DB = {
-    # name : od(in), id(in), make-up torque(ft-lbf), tension rating(lbf), yield torque(ft-lbf) (approx)
-    "NC31": {"od": 4.06, "id": 2.25, "T_makeup_ftlbf":  9000, "F_tensile_lbf": 260000, "T_yield_ftlbf": 15000},
-    "NC35": {"od": 4.50, "id": 2.50, "T_makeup_ftlbf": 11000, "F_tensile_lbf": 300000, "T_yield_ftlbf": 18000},
     "NC38": {"od": 4.75, "id": 2.25, "T_makeup_ftlbf": 12000, "F_tensile_lbf": 350000, "T_yield_ftlbf": 20000},
     "NC40": {"od": 5.00, "id": 2.25, "T_makeup_ftlbf": 16000, "F_tensile_lbf": 420000, "T_yield_ftlbf": 25000},
-    "NC46": {"od": 5.75, "id": 2.75, "T_makeup_ftlbf": 22000, "F_tensile_lbf": 530000, "T_yield_ftlbf": 35000},
     "NC50": {"od": 6.63, "id": 3.00, "T_makeup_ftlbf": 30000, "F_tensile_lbf": 650000, "T_yield_ftlbf": 45000},
 }
 
@@ -62,7 +58,6 @@ def synth_build_hold_drop(kop_md, build_rate, theta_hold_deg, drop_rate, target_
     br = build_rate / 100.0
     dr = drop_rate / 100.0
     theta = np.minimum(theta_hold_deg, np.maximum(0.0, md - kop_md) * br)
-    # simple drop start (change if exact geometry is needed)
     start_drop = 0.75 * target_md
     theta = np.maximum(0.0, theta - np.maximum(0.0, md - start_drop) * dr)
     az = np.full_like(md, az_deg, dtype=float)
@@ -83,7 +78,6 @@ def synth_horizontal(kop_md, build_rate, lateral_length, target_md, az_deg, thet
     return md, theta, az
 
 def mincurv_positions(md, inc_deg, az_deg):
-    md = np.asarray(md); inc_deg = np.asarray(inc_deg); az_deg = np.asarray(az_deg)
     ds = np.diff(md)
     n = len(md)
     N = np.zeros(n); E = np.zeros(n); TVD = np.zeros(n); DLS = np.zeros(n)
@@ -114,31 +108,38 @@ def soft_string_stepper(
     mw_ppg: float,
     scenario: str = "slackoff",
     WOB_lbf: float = 0.0, Mbit_ftlbf: float = 0.0,
-    tortuosity_mode: str = "off",  # "off" | "kappa" | "mu"
-    tau: float = 0.0,              # 0.0 .. 0.5 typ
-    mu_open_boost: float = 0.0,    # hole cleaning booster
-    include_slide_friction: bool = True,  # set False for rotating HL
+    tortuosity_mode: str = "off",    # "off" | "kappa" | "mu"
+    tau: float = 0.0,                # 0.0 .. 0.5 typ
+    mu_open_boost: float = 0.0,      # hole cleaning booster
 ):
     """
-    Δs = 1 ft soft-string integration, bit -> surface.
-    scenario: "pickup" | "slackoff" | "onbottom"
-      - NOTE: rotating off-bottom HL should be computed as average(PU,SO); see wrapper.
-    include_slide_friction=False disables μ_s*N in axial ODE (used for rotating HL).
+    Δs = 1 ft soft-string integration, **bit → surface** (fixed).
+    scenario: "pickup" | "slackoff" | "rotate_off" | "onbottom"
+    tortuosity_mode: inflate kappa or mu by (1+tau) **in OPEN-HOLE segments**.
     """
-    ds = 1.0
-    md = np.asarray(md); inc_full = np.asarray(inc_deg)
-    nseg = len(md) - 1
-    if nseg <= 0: raise ValueError("Trajectory is empty.")
-    inc = np.deg2rad(inc_full[:-1])
+    md = np.asarray(md, dtype=float)
+    inc_arr_deg = np.asarray(inc_deg, dtype=float)
+    nnode = len(md)
+    if nnode < 2: raise ValueError("Trajectory is empty.")
+    ds = np.diff(md)
+    nseg = len(ds)
 
-    kappa_all = np.asarray(kappa_rad_per_ft)
-    kappa_seg = kappa_all[:-1] if len(kappa_all) == len(md) else kappa_all
-    if len(kappa_seg) != nseg: kappa_seg = np.resize(kappa_seg, nseg)
+    # segment inclination: use mid-segment average for smoother normal force
+    seg_inc_rad = np.deg2rad(0.5*(inc_arr_deg[:-1] + inc_arr_deg[1:]))
 
-    cased_seg = np.asarray(cased_mask)[:nseg]
+    # kappa per segment
+    kappa_all = np.asarray(kappa_rad_per_ft, dtype=float)
+    if len(kappa_all) == nnode:
+        kappa_seg = kappa_all[:-1]
+    elif len(kappa_all) == nseg:
+        kappa_seg = kappa_all
+    else:
+        kappa_seg = np.resize(kappa_all, nseg)
+
+    cased_seg = np.asarray(cased_mask, dtype=bool)[:nseg]
     comp_arr  = np.asarray(list(comp_along_depth))[:nseg]
 
-    # per-segment properties
+    # per-segment properties (surface→bit order for now)
     r_eff_ft = np.zeros(nseg); w_air = np.zeros(nseg); w_b = np.zeros(nseg)
     mu_s = np.zeros(nseg); mu_r = np.zeros(nseg)
     BF = bf_from_mw(mw_ppg)
@@ -147,69 +148,86 @@ def soft_string_stepper(
         comp = comp_arr[i]
         od_in = float(comp_props[comp]['od_in']); id_in = float(comp_props[comp]['id_in']); w_air_ft = float(comp_props[comp]['w_air_lbft'])
         w_air[i] = w_air_ft; w_b[i] = w_air_ft*BF
-        r_eff_ft[i] = 0.5*od_in*IN2FT  # contact radius ~ pipe radius (soft-string)
+        r_eff_ft[i] = 0.5*od_in*IN2FT
         if cased_seg[i]:
             mu_s[i] = mu_slide_cased; mu_r[i] = mu_rot_cased
         else:
             mu_s[i] = mu_slide_open + mu_open_boost
             mu_r[i] = mu_rot_open   + mu_open_boost
 
-        # tortuosity penalties
+        # tortuosity penalties apply in open hole only
         if not cased_seg[i]:
             if tortuosity_mode == "kappa":
                 kappa_seg[i] *= (1.0 + tau)
             elif tortuosity_mode == "mu":
                 mu_s[i] *= (1.0 + tau); mu_r[i] *= (1.0 + tau)
 
-    T = np.zeros(nseg+1); M = np.zeros(nseg+1)   # axial tension, torque
-    dT = np.zeros(nseg);  dM = np.zeros(nseg);   N_side = np.zeros(nseg)
+    # flip arrays to **bit→surface** integration order
+    rev = slice(None, None, -1)
+    ds_rev        = ds[rev]
+    inc_rev       = seg_inc_rad[rev]
+    kappa_rev     = kappa_seg[rev]
+    w_b_rev       = w_b[rev]
+    r_eff_rev     = r_eff_ft[rev]
+    mu_s_rev      = mu_s[rev]
+    mu_r_rev      = mu_r[rev]
+    cased_rev     = cased_seg[rev]
+    comp_rev      = comp_arr[rev]
+    md_top_rev    = md[:-1][rev]
+    md_bot_rev    = md[1:][rev]
 
     # boundary condition at bit
+    T = np.zeros(nseg+1); M = np.zeros(nseg+1)
     if scenario == "onbottom":
         T[0] = -float(WOB_lbf)       # compressive at bit
-        M[0] = float(Mbit_ftlbf)     # motor / bit torque allowed
-    else:
-        T[0] = 0.0
-        M[0] = 0.0
+        M[0] = float(Mbit_ftlbf)     # bit/motor torque allowed
 
-    # axial sign convention for weight direction (+ pulling up)
+    # axial sign convention
     if scenario in ("pickup",):
-        sgn_weight = +1.0
-    else:  # "slackoff", "onbottom"
-        sgn_weight = -1.0
+        sgn_ax = +1.0     # pulling out of hole (weight acts upward on segment)
+    elif scenario in ("slackoff", "onbottom"):
+        sgn_ax = -1.0     # running in (weight acts downward on segment)
+    else:  # "rotate_off": no axial motion component; drag from axial friction still responds to N via μ_s* N
+        sgn_ax = 0.0
 
-    for i in range(nseg):
-        N_side[i] = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
-        # axial
-        dT_weight = sgn_weight*w_b[i]*math.cos(inc[i])
-        dT_fric   = (mu_s[i]*N_side[i]) if include_slide_friction else 0.0
-        T_next = T[i] + (dT_weight + dT_fric)*ds
-        # torque
-        M_next = M[i] + (mu_r[i]*N_side[i]*r_eff_ft[i])*ds
-        dT[i] = T_next - T[i]; dM[i] = M_next - M[i]
-        T[i+1] = T_next; M[i+1] = M_next
+    N_side = np.zeros(nseg); dT = np.zeros(nseg); dM = np.zeros(nseg)
+    for j in range(nseg):
+        N_side[j] = w_b_rev[j]*math.sin(inc_rev[j]) + T[j]*kappa_rev[j]
+        T_next = T[j] + (sgn_ax*w_b_rev[j]*math.cos(inc_rev[j]) + mu_s_rev[j]*N_side[j]) * ds_rev[j]
+        M_next = M[j] + (mu_r_rev[j]*N_side[j]*r_eff_rev[j]) * ds_rev[j]
+        dT[j] = T_next - T[j]; dM[j] = M_next - M[j]
+        T[j+1] = T_next; M[j+1] = M_next
 
+    # Package results back in increasing MD order for plotting/joins
     df = pd.DataFrame({
-        "md_top_ft": md[:-1], "md_bot_ft": md[1:], "ds_ft": 1.0,
-        "inc_deg": inc_full[:-1], "kappa_rad_ft": kappa_seg,
-        "w_air_lbft": w_air, "w_b_lbft": w_b,
-        "mu_slide": mu_s, "mu_rot": mu_r,
+        "md_top_ft": md_top_rev, "md_bot_ft": md_bot_rev, "ds_ft": ds_rev,
+        "inc_deg": np.rad2deg(inc_rev), "kappa_rad_ft": kappa_rev,
+        "w_air_lbft": w_air[rev], "w_b_lbft": w_b_rev,
+        "mu_slide": mu_s_rev, "mu_rot": mu_r_rev,
         "N_lbf": N_side, "dT_lbf": dT, "T_next_lbf": T[1:],
-        "dM_lbf_ft": dM, "M_next_lbf_ft": M[1:], "cased?": cased_seg,
-        "comp": comp_arr
+        "dM_lbf_ft": dM, "M_next_lbf_ft": M[1:], "cased?": cased_rev,
+        "comp": comp_rev
     })
+    df.sort_values("md_bot_ft", inplace=True, ignore_index=True)
+
+    # Also return bit→surface cumulative arrays for hookload/torque at surface
     return df, T, M
 
 # ───────────────────── Helper diagnostics ────────────────────────
-def neutral_point_md(md: np.ndarray, T_arr: np.ndarray) -> float:
-    """Return MD where axial force crosses zero (bit→surface array). NaN if none."""
-    if len(md) < 2 or len(T_arr) < 2: return float('nan')
-    for i in range(len(T_arr)-1):
-        t1, t2 = T_arr[i], T_arr[i+1]
-        if t1 == 0: return md[i]
+def neutral_point_md(md: np.ndarray, T_bit_to_surface: np.ndarray) -> float:
+    """
+    Return MD where axial force crosses zero in **bit→surface** array T (length nseg+1).
+    Returns NaN if no sign change.
+    """
+    if len(md) < 2 or len(T_bit_to_surface) < 2: return float('nan')
+    # Construct segment nodes in bit→surface order
+    md_nodes = np.linspace(md[-1], md[0], len(T_bit_to_surface))
+    for i in range(len(T_bit_to_surface)-1):
+        t1, t2 = T_bit_to_surface[i], T_bit_to_surface[i+1]
+        if t1 == 0: return md_nodes[i]
         if t1*t2 < 0:
             frac = abs(t1)/(abs(t1)+abs(t2)+1e-9)
-            return md[i] + frac*(md[i+1]-md[i])
+            return md_nodes[i] + (md_nodes[i+1]-md_nodes[i])*frac
     return float('nan')
 
 def grid_calibrate_mu(
@@ -219,12 +237,15 @@ def grid_calibrate_mu(
     measured_rotate_hl: Optional[float], measured_surface_torque: Optional[float],
     mu_ranges: Dict[str, Tuple[float,float,float]],
 ):
-    """Grid search across μ ranges; returns best μ dict or None."""
-    targets = []
-    if measured_pickup_hl is not None:   targets.append("pickup")
-    if measured_slackoff_hl is not None: targets.append("slackoff")
-    if measured_rotate_hl is not None:   targets.append("rotate_off")
-    if len(targets) == 0: return None
+    """
+    Grid search across μ ranges; returns best μ dict or None.
+    'Rotate off-bottom' HL is computed as average of pickup & slackoff HLs.
+    """
+    use_targets = []
+    if measured_pickup_hl is not None:   use_targets.append("pickup")
+    if measured_slackoff_hl is not None: use_targets.append("slackoff")
+    if measured_rotate_hl is not None:   use_targets.append("rotate_off")
+    if len(use_targets) == 0: return None
 
     md = np.asarray(md)
     idx = np.searchsorted(md, depth_for_fit, side="right")
@@ -243,37 +264,40 @@ def grid_calibrate_mu(
             for mu_c_r in mu_c_r_rng:
                 for mu_o_r in mu_o_r_rng:
                     err2 = 0.0
-
-                    # pickup & slackoff
-                    df_pick, T_pick, M_pick = soft_string_stepper(
-                        md_fit, inc_fit, kappa_fit, cased_fit, comp_fit, comp_props,
-                        mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg,
-                        scenario="pickup", WOB_lbf=0.0, Mbit_ftlbf=0.0,
-                        include_slide_friction=True
-                    )
-                    df_so, T_so, M_so = soft_string_stepper(
-                        md_fit, inc_fit, kappa_fit, cased_fit, comp_fit, comp_props,
-                        mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg,
-                        scenario="slackoff", WOB_lbf=0.0, Mbit_ftlbf=0.0,
-                        include_slide_friction=True
-                    )
-                    HL_pick = abs(T_pick[-1]); HL_so = abs(T_so[-1])
-                    HL_rot  = 0.5*(HL_pick + HL_so)
-
-                    if measured_pickup_hl is not None:
-                        err2 += (HL_pick - measured_pickup_hl)**2
-                    if measured_slackoff_hl is not None:
-                        err2 += (HL_so   - measured_slackoff_hl)**2
-                    if measured_rotate_hl is not None:
-                        err2 += (HL_rot  - measured_rotate_hl)**2
-
-                    if measured_surface_torque is not None:
-                        # torque using rotating friction only
-                        df_rot, _, M_rot = soft_string_stepper(
+                    # pickup
+                    if "pickup" in use_targets:
+                        _, T_p, M_p = soft_string_stepper(
                             md_fit, inc_fit, kappa_fit, cased_fit, comp_fit, comp_props,
-                            mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg,
-                            scenario="slackoff",  # weight sign irrelevant to torque sum
-                            include_slide_friction=False
+                            mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg, scenario="pickup"
+                        )
+                        HL_pick = abs(T_p[-1])
+                        err2 += (HL_pick - measured_pickup_hl)**2
+                    # slackoff
+                    if "slackoff" in use_targets:
+                        _, T_s, M_s = soft_string_stepper(
+                            md_fit, inc_fit, kappa_fit, cased_fit, comp_fit, comp_props,
+                            mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg, scenario="slackoff"
+                        )
+                        HL_slack = abs(T_s[-1])
+                        err2 += (HL_slack - measured_slackoff_hl)**2
+                    # rotate off-bottom: average HL of pickup & slackoff
+                    if "rotate_off" in use_targets:
+                        HL_rot = None
+                        if 'T_p' in locals() and 'T_s' in locals():
+                            HL_rot = 0.5*(abs(T_p[-1]) + abs(T_s[-1]))
+                        else:
+                            # compute if not already done
+                            _, T_p2, _ = soft_string_stepper(md_fit, inc_fit, kappa_fit, cased_fit, comp_fit, comp_props,
+                                                             mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg, scenario="pickup")
+                            _, T_s2, _ = soft_string_stepper(md_fit, inc_fit, kappa_fit, cased_fit, comp_fit, comp_props,
+                                                             mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg, scenario="slackoff")
+                            HL_rot = 0.5*(abs(T_p2[-1]) + abs(T_s2[-1]))
+                        err2 += (HL_rot - measured_rotate_hl)**2
+                    # optional torque at surface for rotate-off
+                    if measured_surface_torque is not None:
+                        _, _, M_rot = soft_string_stepper(
+                            md_fit, inc_fit, kappa_fit, cased_fit, comp_fit, comp_props,
+                            mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg, scenario="rotate_off"
                         )
                         err2 += (abs(M_rot[-1]) - measured_surface_torque)**2
 
@@ -287,75 +311,61 @@ def grid_calibrate_mu(
 
 with tab:
     st.header("Wellpath + Torque & Drag (Δs = 1 ft) — Linked")
-    st.caption("Minimum-curvature survey; Johancsik soft-string; Δs=1 ft piecewise integration. "
-               "Rotating off-bottom hookload = average of pickup & slack-off (torque from rotating μ only).")
 
-    # ───────── Survey: import or synthesize
-    st.subheader("Trajectory — import survey (CSV) or synthesize (Minimum Curvature)")
-    up = st.file_uploader("Upload survey CSV with columns: MD (ft), INC (deg), AZI (deg). Leave empty to synthesize.", type=["csv"])
-    if up is not None:
-        try:
-            df_svy = pd.read_csv(up)
-            if not set(["MD","INC","AZI"]).issubset(df_svy.columns.str.upper()):
-                # try case-insensitive
-                cols = {c.upper(): c for c in df_svy.columns}
-                md = df_svy[cols["MD"]].to_numpy(dtype=float)
-                inc_deg = df_svy[cols["INC"]].to_numpy(dtype=float)
-                az_deg  = df_svy[cols["AZI"]].to_numpy(dtype=float)
-            else:
-                md     = df_svy[[c for c in df_svy.columns if c.upper()=="MD"][0]].to_numpy(dtype=float)
-                inc_deg= df_svy[[c for c in df_svy.columns if c.upper()=="INC"][0]].to_numpy(dtype=float)
-                az_deg = df_svy[[c for c in df_svy.columns if c.upper()=="AZI"][0]].to_numpy(dtype=float)
-            # resample to Δs=1 ft
-            md_grid = np.arange(float(md.min()), float(md.max())+1.0, 1.0)
-            inc_grid = np.interp(md_grid, md, inc_deg)
-            az_grid  = np.interp(md_grid, md, az_deg)
-            md, inc_deg, az = md_grid, inc_grid, az_grid
-            st.success(f"Survey loaded: {len(md)} points at 1‑ft resolution.")
-        except Exception as e:
-            st.error(f"Failed to parse CSV: {e}")
-            md = np.array([]); inc_deg = np.array([]); az = np.array([])
+    # ───────── Trajectory
+    st.subheader("Trajectory & 3D schematic (Minimum Curvature)")
+    c1, c2, c3, c4 = st.columns(4)
+    profile = c1.selectbox("Profile", ["Build & Hold", "Build–Hold–Drop", "Horizontal (build + lateral)", "Upload survey (CSV: MD,INC,AZI)"])
+    kop_md  = c2.number_input("KOP MD (ft)", 0.0, 50000.0, 2000.0, 50.0, disabled=(profile=="Upload survey (CSV: MD,INC,AZI)"))
+    build   = c3.number_input("Build rate (deg/100 ft)", 0.0, 30.0, 3.0, 0.1, disabled=(profile=="Upload survey (CSV: MD,INC,AZI)"))
+    az_deg  = c4.number_input("Azimuth (deg, clockwise from North)", 0.0, 360.0, 0.0, 1.0, disabled=(profile=="Upload survey (CSV: MD,INC,AZI)"))
+
+    r1, r2, r3 = st.columns(3)
+    if profile == "Build & Hold":
+        theta_hold = r1.number_input("Final inclination (deg)", 0.0, 90.0, 30.0, 0.5)
+        target_md  = r2.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
+        md, inc_deg, az = synth_build_hold(kop_md, build, theta_hold, target_md, az_deg)
+    elif profile == "Build–Hold–Drop":
+        theta_hold = r1.number_input("Hold inclination (deg)", 0.0, 90.0, 30.0, 0.5)
+        drop_rate  = r2.number_input("Drop rate (deg/100 ft)", 0.0, 30.0, 2.0, 0.1)
+        target_md  = r3.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
+        md, inc_deg, az = synth_build_hold_drop(kop_md, build, theta_hold, drop_rate, target_md, az_deg)
+    elif profile == "Horizontal (build + lateral)":
+        lateral    = r1.number_input("Lateral length (ft)", 0.0, 30000.0, 2000.0, 100.0)
+        target_md  = r2.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
+        md, inc_deg, az = synth_horizontal(kop_md, build, lateral, target_md, az_deg)
     else:
-        c1, c2, c3, c4 = st.columns(4)
-        profile = c1.selectbox("Profile", ["Build & Hold", "Build–Hold–Drop", "Horizontal (build + lateral)"])
-        kop_md  = c2.number_input("KOP MD (ft)", 0.0, 50000.0, 2000.0, 50.0)
-        build   = c3.number_input("Build rate (deg/100 ft)", 0.0, 30.0, 3.0, 0.1)
-        az0     = c4.number_input("Azimuth (deg, clockwise from North)", 0.0, 360.0, 0.0, 1.0)
-
-        r1, r2, r3 = st.columns(3)
-        if profile == "Build & Hold":
-            theta_hold = r1.number_input("Final inclination (deg)", 0.0, 90.0, 30.0, 0.5)
-            target_md  = r2.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
-            md, inc_deg, az = synth_build_hold(kop_md, build, theta_hold, target_md, az0)
-        elif profile == "Build–Hold–Drop":
-            theta_hold = r1.number_input("Hold inclination (deg)", 0.0, 90.0, 30.0, 0.5)
-            drop_rate  = r2.number_input("Drop rate (deg/100 ft)", 0.0, 30.0, 2.0, 0.1)
-            target_md  = r3.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
-            md, inc_deg, az = synth_build_hold_drop(kop_md, build, theta_hold, drop_rate, target_md, az0)
+        upfile = r1.file_uploader("Upload survey CSV (columns: MD,INC,AZI)", type=["csv"])
+        if upfile is not None:
+            df_s = pd.read_csv(upfile)
+            md = df_s.iloc[:,0].astype(float).to_numpy()
+            inc_deg = df_s.iloc[:,1].astype(float).to_numpy()
+            az = df_s.iloc[:,2].astype(float).to_numpy()
         else:
-            lateral    = r1.number_input("Lateral length (ft)", 0.0, 30000.0, 2000.0, 100.0)
-            target_md  = r2.number_input("Target MD (ft)", 100.0, 100000.0, 10000.0, 100.0)
-            md, inc_deg, az = synth_horizontal(kop_md, build, lateral, target_md, az0)
-
-    if len(md) < 3:
-        st.stop()
+            st.stop()
 
     N, E, TVD, DLS = mincurv_positions(md, inc_deg, az)
 
-    # ───────── Casing / OH (simple last string)
-    st.subheader("Casing / Open-hole (simple: last string + open hole)")
+    # ───────── Casing / OH
+    st.subheader("Casing / Open-hole (simple, last string + open hole)")
     md_end = float(md[-1])
     cc1, cc2, cc3, cc4, cc5 = st.columns(5)
     nominal = cc1.selectbox("Last casing nominal OD", list(CASING_DB.keys()), index=1)  # default 9-5/8
     weight  = cc2.selectbox("lb/ft (standards only)", list(CASING_DB[nominal]["weights"].keys()))
     casing_id_in = float(CASING_DB[nominal]["weights"][weight])
     cc3.text_input("Casing ID (in, locked)", f"{casing_id_in:.3f}", disabled=True)
-    shoe_md = cc4.slider("Shoe MD (ft)", 0.0, md_end, min(3000.0, md_end), 50.0)
+
+    if 'shoe_md' not in st.session_state:
+        st.session_state['shoe_md'] = min(3000.0, md_end)
+    st.session_state['shoe_md'] = clamp(float(st.session_state['shoe_md']), 0.0, md_end)
+    st.session_state['shoe_md'] = cc4.slider("Shoe MD (ft)", 0.0, md_end, float(st.session_state['shoe_md']), 50.0)
+
     hole_diam_in = cc5.number_input("Open-hole diameter (in)", 4.0, 20.0, 8.50, 0.01)
+    shoe_md = float(st.session_state['shoe_md'])
     cased_mask = md <= shoe_md
-    idx = int(np.searchsorted(md, shoe_md, side='right'))
 
     # ───────── 3D split by shoe
+    idx = int(np.searchsorted(md, shoe_md, side='right'))
     fig3d = go.Figure()
     if idx > 1:
         fig3d.add_trace(go.Scatter3d(x=E[:idx], y=N[:idx], z=TVD[:idx],
@@ -371,7 +381,7 @@ with tab:
 
     # 2D TVD-VS
     st.subheader("2D Wellbore Profile — TVD vs Vertical Section")
-    vs_ref = st.number_input("VS reference azimuth (deg)", 0.0, 360.0, float(az[0] if len(az) else az0), 1.0)
+    vs_ref = st.number_input("VS reference azimuth (deg)", 0.0, 360.0, float(az[0] if len(az) else az_deg), 1.0)
     VS = N*np.cos(vs_ref*DEG2RAD) + E*np.sin(vs_ref*DEG2RAD)
     fig2d = go.Figure()
     if idx > 1: fig2d.add_trace(go.Scatter(x=VS[:idx], y=TVD[:idx], mode="lines", line=dict(width=6, color="#4cc9f0"), name="Cased"))
@@ -388,13 +398,13 @@ with tab:
     }), use_container_width=True)
 
     # ───────── T&D Inputs
-    st.subheader("Soft-string Torque & Drag — Johancsik (linked)")
+    st.subheader("Soft-string Torque & Drag — Johancsik (linked to survey above)")
     with st.expander("Typical μ starting ranges (lecture hints)"):
         st.markdown("""
 - **Casing (WBM):** 0.15 – 0.25 (sliding/rotating similar)  
-- **Open-hole (WBM):** 0.25 – 0.40 (higher when cleaning is poor)  
+- **Open-hole (WBM):** 0.25 – 0.40 (higher under poor cleaning)  
 - **OBM/SBM:** often lower than WBM  
-> Calibrate with **history matching** for your section.
+> Calibrate with history matching for your well/section (see bottom).
 """)
 
     mu_cased_slide = st.number_input("μ in casing (sliding)", 0.05, 0.80, 0.25, 0.01)
@@ -407,38 +417,37 @@ with tab:
     cleaning_mode = hc1.selectbox("Hole-cleaning condition (open-hole μ booster)", ["Good (0)", "Fair (+0.03)", "Poor (+0.08)"], index=0)
     mu_boost = {"Good (0)":0.0, "Fair (+0.03)":0.03, "Poor (+0.08)":0.08}[cleaning_mode]
     tort_mode = hc2.selectbox("Tortuosity penalty mode", ["off", "kappa", "mu"], index=0)
-    tau = st.slider("Penalty factor τ (open-hole only)", 0.0, 0.5, 0.2, 0.05) if tort_mode != "off" else 0.0
+    tau = st.slider("Penalty factor τ (open-hole)", 0.0, 0.5, 0.2, 0.05) if tort_mode != "off" else 0.0
 
     st.markdown("**Drillstring (bit up)**")
     d1, d2, d3 = st.columns(3)
-    dc_len  = d1.number_input("DC length (ft)",   0.0, 10000.0, 600.0, 10.0)
+    dc_len  = d1.number_input("DC length (ft)", 0.0, 10000.0, 600.0, 10.0)
     hwdp_len= d2.number_input("HWDP length (ft)", 0.0, 20000.0, 1000.0, 10.0)
-    dp_len  = d3.number_input("DP length (ft)",   0.0, 50000.0, max(0.0, float(md[-1])-(dc_len+hwdp_len)), 10.0)
+    dp_len  = d3.number_input("DP length (ft)", 0.0, 50000.0, max(0.0, float(md[-1])-(dc_len+hwdp_len)), 10.0)
 
     e1, e2, e3 = st.columns(3)
-    dc_od   = e1.number_input("DC OD (in)",   3.0, 12.0, 8.0, 0.1)
+    dc_od = e1.number_input("DC OD (in)", 3.0, 12.0, 8.0, 0.1)
     hwdp_od = e2.number_input("HWDP OD (in)", 2.0, 8.0, 3.5, 0.1)
-    dp_od   = e3.number_input("DP OD (in)",   3.0, 6.625, 5.0, 0.01)
+    dp_od = e3.number_input("DP OD (in)", 3.0, 6.625, 5.0, 0.01)
 
     i1, i2, i3 = st.columns(3)
-    dc_id   = i1.number_input("DC ID (in)",   0.5, 6.0, 2.81, 0.01)
+    dc_id = i1.number_input("DC ID (in)", 0.5, 6.0, 2.81, 0.01)
     hwdp_id = i2.number_input("HWDP ID (in)", 0.5, 4.0, 2.0, 0.01)
-    dp_id   = i3.number_input("DP ID (in)",   1.5, 5.0, 4.28, 0.01)
+    dp_id = i3.number_input("DP ID (in)", 1.5, 5.0, 4.28, 0.01)
 
     w1, w2, w3 = st.columns(3)
     dc_w   = w1.number_input("DC weight (air, lb/ft)",   30.0, 150.0, 66.7, 0.1)
     hwdp_w = w2.number_input("HWDP weight (air, lb/ft)",  5.0,  40.0, 16.0, 0.1)
     dp_w   = w3.number_input("DP weight (air, lb/ft)",    8.0,  40.0, 19.5, 0.1)
 
-    # map string along depth
+    # Map string along depth (surface→bit indexing)
     nseg = len(md) - 1
     comp_along = np.empty(nseg, dtype=object)
     for i in range(nseg):
-        from_bit = float(md[-1]) - md[i]
+        from_bit = float(md[-1]) - md[i]  # distance from bit at segment top
         if from_bit <= dc_len: comp_along[i] = "DC"
         elif from_bit <= dc_len + hwdp_len: comp_along[i] = "HWDP"
         else: comp_along[i] = "DP"
-
     comp_props = {
         "DC":   {"od_in": dc_od,   "id_in": dc_id,   "w_air_lbft": dc_w},
         "HWDP": {"od_in": hwdp_od, "id_in": hwdp_id, "w_air_lbft": hwdp_w},
@@ -459,70 +468,58 @@ with tab:
     deltaP = st.number_input("Motor ΔP (psi)", 0.0, 5000.0, 0.0, 10.0) if motor_mode else 0.0
     Mbit = K_tbit * deltaP if motor_mode and scenario == "onbottom" else 0.0
 
-    # main runs (PU/SO for HL; rotate for torque)
-    df_pick, T_pick, M_pick = soft_string_stepper(
+    # main run
+    df_itr, T_arr_bit2surf, M_arr_bit2surf = soft_string_stepper(
         md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
         mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
-        mw_ppg, scenario="pickup", WOB_lbf=0.0, Mbit_ftlbf=0.0,
-        tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost,
-        include_slide_friction=True
+        mw_ppg, scenario=scenario, WOB_lbf=wob, Mbit_ftlbf=Mbit,
+        tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
     )
-    df_so, T_so, M_so = soft_string_stepper(
-        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-        mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
-        mw_ppg, scenario="slackoff", WOB_lbf=0.0, Mbit_ftlbf=0.0,
-        tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost,
-        include_slide_friction=True
-    )
-    df_rot_tq, _, M_rot = soft_string_stepper(
-        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-        mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
-        mw_ppg, scenario="slackoff", WOB_lbf=0.0, Mbit_ftlbf=0.0,
-        tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost,
-        include_slide_friction=False  # torque only, no axial sliding friction
-    )
-    # on-bottom (for NP)
-    df_on, T_on, _ = soft_string_stepper(
-        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-        mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
-        mw_ppg, scenario="onbottom", WOB_lbf=wob, Mbit_ftlbf=Mbit,
-        tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost,
-        include_slide_friction=True
-    )
-
-    depth = df_pick["md_bot_ft"].to_numpy()
-    HL_pick = abs(T_pick[-1]); HL_so = abs(T_so[-1])
-    HL_rot  = 0.5*(HL_pick + HL_so)
-    surf_torque = abs(M_rot[-1]) if scenario in ("rotate_off", "onbottom") else abs(M_rot[-1])
-
-    st.success(f"Surface HL — Pickup: {HL_pick:,.0f} lbf | Slack-off: {HL_so:,.0f} lbf | Rotating (avg): {HL_rot:,.0f} lbf")
-    st.info(f"Surface torque (rotating off-bottom): {surf_torque:,.0f} lbf-ft")
+    # Hookload = magnitude of surface axial force
+    surf_hookload = abs(T_arr_bit2surf[-1])
+    surf_torque = abs(M_arr_bit2surf[-1])
+    # Rotating off-bottom HL (presentation): average of pickup & slackoff
+    if scenario == "rotate_off":
+        _, T_pick, _ = soft_string_stepper(md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+                                           mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
+                                           mw_ppg, scenario="pickup", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost)
+        _, T_slck, _ = soft_string_stepper(md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+                                           mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
+                                           mw_ppg, scenario="slackoff", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost)
+        surf_hookload = 0.5*(abs(T_pick[-1]) + abs(T_slck[-1]))
+    st.success(f"Surface hookload: {surf_hookload:,.0f} lbf — Surface torque: {surf_torque:,.0f} lbf-ft")
 
     # ───────── Safety & limits
     st.subheader("Safety & limits")
     s1, s2, s3 = st.columns(3)
-    tj_name = s1.selectbox("Tool-joint size", list(TOOL_JOINT_DB.keys()), index=2)  # default NC38
+    tj_name = s1.selectbox("Tool-joint size", list(TOOL_JOINT_DB.keys()), index=2)
     sf_joint = s2.number_input("Safety factor (tool-joint)", 1.00, 2.00, 1.10, 0.05)
     sf_tension = s3.number_input("SF for pipe body tension", 1.00, 2.00, 1.15, 0.05)
 
     rig_torque_lim = st.number_input("Top-drive torque limit (lbf-ft)", 10000, 150000, 60000, 1000)
     rig_pull_lim   = st.number_input("Rig max hookload (lbf)", 50000, 1500000, 500000, 5000)
 
-    # 0.8×MU rule and margins
     T_makeup = TOOL_JOINT_DB[tj_name]['T_makeup_ftlbf']
     T80 = 0.8*T_makeup
     torque_margin = T80 - surf_torque
-    pull_margin   = rig_pull_lim - HL_rot
+    pull_margin   = rig_pull_lim - surf_hookload
     passed_80 = torque_margin >= 0
     st.info(f"0.8×Make-up = {T80/1000:.1f} k lbf-ft — Surface torque = {surf_torque/1000:.2f} k → "
             f"{'PASS ✅' if passed_80 else 'FAIL ❌'} (margin {torque_margin/1000:.2f} k)")
+    st.caption("Rule-of-thumb used in class/software: keep torque ≤ ~80% of tool-joint make-up torque. Adjust with SF if needed.")
 
     # Neutral point from on-bottom run
-    np_md = neutral_point_md(md, np.array(T_on))
-    if math.isnan(np_md):
+    df_on, T_on, _ = soft_string_stepper(
+        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+        mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
+        mw_ppg, scenario="onbottom", WOB_lbf=wob, Mbit_ftlbf=Mbit,
+        tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+    )
+    np_at_md = neutral_point_md(md, T_on)
+    if math.isnan(np_at_md):
         st.warning("Neutral point not found (no sign change in axial).")
     else:
-        NP_from_bit = md[-1] - np_md
+        NP_from_bit = md[-1] - np_at_md
         in_DCs = NP_from_bit <= dc_len
         st.write(f"Neutral point depth from bit ≈ **{NP_from_bit:,.0f} ft** → {'✅ inside DCs' if in_DCs else '❌ not inside DCs'}")
         if not in_DCs:
@@ -537,15 +534,15 @@ with tab:
     SR_dp_h   = I_h / I_dp if I_dp>0 else float('inf')
     SR_h_dc   = I_dc/ I_h if I_h>0 else float('inf')
     c1m, c2m, c3m, c4m = st.columns(4)
-    c1m.metric("BSR DP→HWDP", f"{BSR_dp_h:.2f}", help="Bending Strength Ratio. Flag if <~1.0–1.1")
+    c1m.metric("BSR DP→HWDP", f"{BSR_dp_h:.2f}")
     c2m.metric("BSR HWDP→DC", f"{BSR_h_dc:.2f}")
-    c3m.metric("SR DP→HWDP", f"{SR_dp_h:.2f}", help="Stiffness Ratio (I ratio). Big jumps (>~1.4) raise twist-off risk.")
+    c3m.metric("SR DP→HWDP", f"{SR_dp_h:.2f}")
     c4m.metric("SR HWDP→DC", f"{SR_h_dc:.2f}")
 
-    # ───────── Simple/Advanced charting
+    # ───────── Classic/simple toggle
     simple_mode = st.checkbox("Use classic simple view (hide safety overlays & μ-sweep)", value=False)
 
-    # overlay toggle for calibrated μ curves
+    # ───────── Overlay toggle for calibrated μ curves
     overlay_calibrated = False
     mu_fit = st.session_state.get("μ_fit")
     if mu_fit is not None and not simple_mode:
@@ -557,24 +554,16 @@ with tab:
             )
 
     if simple_mode:
-        # Torque vs Depth (rotating)
-        figT = go.Figure(go.Scatter(x=np.abs(df_rot_tq["M_next_lbf_ft"].to_numpy()),
-                                    y=df_rot_tq["md_bot_ft"], mode="lines", name="Torque"))
-        figT.update_xaxes(title_text="Torque (lbf-ft)"); figT.update_yaxes(title_text="Depth (ft)", autorange="reversed")
-        # Hookload magnitude vs depth (PU, SO, Rot avg)
-        figH = go.Figure()
-        figH.add_trace(go.Scatter(x=np.abs(df_pick["T_next_lbf"].to_numpy()), y=df_pick["md_bot_ft"], mode="lines", name="Pickup"))
-        figH.add_trace(go.Scatter(x=np.abs(df_so["T_next_lbf"].to_numpy()),   y=df_so["md_bot_ft"],   mode="lines", name="Slack-off"))
-        figH.add_trace(go.Scatter(x=0.5*(np.abs(df_pick["T_next_lbf"].to_numpy())+np.abs(df_so["T_next_lbf"].to_numpy())),
-                                  y=df_so["md_bot_ft"],   mode="lines", name="Rotating (avg)", line=dict(dash="dot")))
-        figH.update_xaxes(title_text="Hookload (lbf)"); figH.update_yaxes(title_text="Depth (ft)", autorange="reversed")
+        figT = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["M_next_lbf_ft"]), mode="lines", name="Torque"))
+        figT.update_xaxes(title_text="MD (ft)"); figT.update_yaxes(title_text="Torque (lbf-ft)")
+        figH = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["T_next_lbf"]), mode="lines", name="Hookload"))
+        figH.update_xaxes(title_text="MD (ft)"); figH.update_yaxes(title_text="Hookload (lbf)")
         c1x, c2x = st.columns(2)
         with c1x: st.plotly_chart(figT, use_container_width=True)
         with c2x: st.plotly_chart(figH, use_container_width=True)
     else:
-        st.markdown("### T&D Model Charts — Risk curves and limits")
-
-        mu_band = st.multiselect("μ sweep for off-bottom risk curves (rotating torque)", [0.15,0.20,0.25,0.30,0.35,0.40], default=[0.20,0.25,0.30,0.35])
+        st.markdown("### T&D Model Chart — Risk curves and limits")
+        mu_band = st.multiselect("μ sweep for off-bottom risk curves", [0.15,0.20,0.25,0.30,0.35,0.40], default=[0.20,0.25,0.30,0.35])
 
         T_makeup_sf = TOOL_JOINT_DB[tj_name]['T_makeup_ftlbf']/sf_joint
         T_yield_sf  = TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint
@@ -583,12 +572,12 @@ with tab:
         def run_td_off_bottom(mu_slide: float, mu_rot: float):
             df_tmp, T_tmp, M_tmp = soft_string_stepper(
                 md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-                mu_slide, mu_slide, mu_rot, mu_rot, mw_ppg,
-                scenario="slackoff",  # axial friction off; torque on
-                tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost,
-                include_slide_friction=False
+                mu_slide, mu_slide, mu_rot, mu_rot, mw_ppg, scenario="rotate_off",
+                tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
             )
-            return df_tmp["md_bot_ft"].to_numpy(), np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
+            depth = df_tmp["md_bot_ft"].to_numpy()
+            torque = np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
+            return depth, torque
 
         # LEFT: μ-sweep off-bottom torque vs depth
         fig_left = go.Figure()
@@ -596,9 +585,9 @@ with tab:
             dmu, tmu = run_td_off_bottom(mu, mu)
             fig_left.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines"))
         fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
-                           annotation_text="Make-up/SF", annotation_position="top right")
-        fig_left.add_vline(x=(0.8*TOOL_JOINT_DB[tj_name]['T_makeup_ftlbf'])/1000.0, line_color="#00d5ff", line_dash="dot",
-                           annotation_text="0.8×MU", annotation_position="bottom right")
+                           annotation_text="Make-up / SF")
+        fig_left.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot",
+                           annotation_text="Top-drive limit")
         fig_left.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)")
         fig_left.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
@@ -611,68 +600,63 @@ with tab:
                            name="μ (calibrated, off-bottom)", line=dict(dash="dash"))
             )
 
-        # RIGHT: elemental torque + limits + combined-load envelope
+        # RIGHT: elemental torque + limits
         fig_right = go.Figure()
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu, mu)
-            if tmu[0] < tmu[-1]: tmu = tmu[::-1]
             fig_right.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines"))
-        fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up/SF")
+        fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
         fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
 
-        # Pickup tension profile for combined-load limit (axial)
+        # combined load using pickup tension (tension only)
+        df_pick, T_pick, M_pick = soft_string_stepper(
+            md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+            mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot, mw_ppg,
+            scenario="pickup", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+        )
         F_ax = np.maximum(0.0, df_pick["T_next_lbf"].to_numpy())
         T_allow = T_yield_sf * np.sqrt(np.clip(1.0 - (F_ax/np.maximum(F_tensile_sf,1.0))**2, 0.0, 1.0))
         fig_right.add_trace(go.Scatter(x=T_allow/1000.0, y=df_pick["md_bot_ft"].to_numpy(), mode="lines",
-                                       name="TJ combined-load limit (approx)", line=dict(dash="dot")))
+                                       name="TJ combined-load limit", line=dict(dash="dot")))
         fig_right.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_right.update_xaxes(title_text="Elemental torque (k lbf-ft)")
         fig_right.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
 
-        if overlay_calibrated:
-            dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
-            if tcal[0] < tcal[-1]: tcal = tcal[::-1]
-            fig_right.add_trace(
-                go.Scatter(x=tcal/1000.0, y=dcal, mode="lines",
-                           name="μ (calibrated, elemental)", line=dict(dash="dash"))
-            )
+        # Component band annotations (optional)
+        y_dc = md[-1] - dc_len; y_h = md[-1] - (dc_len+hwdp_len)
+        for y, label in [(y_dc, "DC top"), (y_h, "HWDP top")]:
+            if 0 < y < md[-1]:
+                fig_left.add_hline(y=y, line_dash="dot", line_color="#888", annotation_text=label, annotation_position="right")
+                fig_right.add_hline(y=y, line_dash="dot", line_color="#888", annotation_text=label, annotation_position="right")
 
         cL, cR = st.columns(2)
         with cL: st.plotly_chart(fig_left, use_container_width=True)
         with cR: st.plotly_chart(fig_right, use_container_width=True)
 
-        # Envelope & Hookload diagnostics (buckling plots & rig limit)
-        Epsi = 30.0e6
-        Iin4_dp = I_in4(dp_od, dp_id)
+        # Envelope & Hookload diagnostics
         rbore_ft = 0.5*hole_diam_in*IN2FT; rpipe_ft = 0.5*dp_od*IN2FT
         clearance_ft = max(1e-3, rbore_ft - rpipe_ft)
-        theta = np.deg2rad(np.maximum(0.0, df_pick['inc_deg'].to_numpy()))
-        Fs = 2.0*np.sqrt(Epsi*Iin4_dp * df_pick['w_b_lbft'].to_numpy()*np.sin(theta)/clearance_ft)
-        Fh = 1.6*Fs  # indicator
+        theta = np.deg2rad(np.maximum(0.0, df_itr['inc_deg'].to_numpy()))
+        Fs = 2.0*np.sqrt(E_STEEL_PSI*I_in4(dp_od, dp_id) * df_itr['w_b_lbft'].to_numpy()*np.sin(theta)/clearance_ft)
+        Fh = 1.6*Fs
 
         fig_env = go.Figure()
-        F_env = np.linspace(0, TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension, 100)
+        F_env = np.linspace(0, TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension, 200)
         T_env = (TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint)*np.sqrt(np.clip(1.0 - (F_env/np.maximum(F_env.max(),1.0))**2, 0.0, 1.0))
-        fig_env.add_trace(go.Scatter(x=T_env/1000.0, y=F_env/1000.0, mode="lines", name="API-style envelope (approx)"))
+        fig_env.add_trace(go.Scatter(x=T_env/1000.0, y=F_env/1000.0, mode="lines", name="API 7G envelope (approx)"))
         fig_env.add_vline(x=0.8*T_makeup/1000.0, line_color="#00d5ff", line_dash="dash", annotation_text="0.8×MU")
-        fig_env.add_trace(go.Scatter(x=[surf_torque/1000.0], y=[HL_rot/1000.0], mode="markers",
-                                     name="Operating point (rotating)", marker=dict(size=10, color="orange")))
+        fig_env.add_trace(go.Scatter(x=[surf_torque/1000.0], y=[surf_hookload/1000.0], mode="markers",
+                                     name="Operating point", marker=dict(size=10, color="orange")))
         fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
         fig_env.update_yaxes(title_text="Tension (k lbf)")
         fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
 
         fig_hl = go.Figure()
-        # Hookloads vs depth
-        fig_hl.add_trace(go.Scatter(x=np.abs(df_pick['T_next_lbf'].to_numpy())/1000.0, y=depth,
-                                    mode="lines", name="HL Pickup"))
-        fig_hl.add_trace(go.Scatter(x=np.abs(df_so['T_next_lbf'].to_numpy())/1000.0, y=depth,
-                                    mode="lines", name="HL Slack-off"))
-        fig_hl.add_trace(go.Scatter(x=(0.5*(np.abs(df_pick['T_next_lbf'].to_numpy())+np.abs(df_so['T_next_lbf'].to_numpy())))/1000.0, y=depth,
-                                    mode="lines", name="HL Rotating (avg)", line=dict(dash="dot")))
+        fig_hl.add_trace(go.Scatter(x=np.abs(df_itr['T_next_lbf'].to_numpy())/1000.0, y=df_itr["md_bot_ft"].to_numpy(),
+                                    mode="lines", name="Hookload"))
         fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
-        # Buckling indicators
-        fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs (indic.)", line=dict(dash="dash")))
-        fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh (indic.)", line=dict(dash="dot")))
+        fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=df_itr["md_bot_ft"].to_numpy(), name="Sinusoidal Fs", line=dict(dash="dash")))
+        fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=df_itr["md_bot_ft"].to_numpy(), name="Helical Fh", line=dict(dash="dot")))
         fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_hl.update_xaxes(title_text="Force / Hookload (k lbf)")
         fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
@@ -718,22 +702,13 @@ with tab:
                 st.session_state["μ_fit"] = best
                 st.success(f"Fitted μ: casing(slide)={best['mu_c_s']:.2f}, open(slide)={best['mu_o_s']:.2f}, "
                            f"casing(rot)={best['mu_c_r']:.2f}, open(rot)={best['mu_o_r']:.2f} (SSE={best['SSE']:.1f})")
-                st.caption("Overlay toggle (above) compares baseline vs calibrated curves; "
-                           "or copy values into inputs and re-run.")
+                st.caption("Use the overlay toggle above to compare baseline vs calibrated curves; or copy values into inputs and re-run.")
         except Exception as e:
             st.error(f"Calibration failed: {e}")
 
-    # Download elemental results
-    st.markdown("### Iteration trace (first 12 rows) + download")
-    st.dataframe(df_pick.head(12), use_container_width=True)
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
-        df_pick.to_excel(xw, index=False, sheet_name="Pickup")
-        df_so.to_excel(xw,   index=False, sheet_name="Slackoff")
-        df_rot_tq.to_excel(xw, index=False, sheet_name="Rotate_TorqueOnly")
-    st.download_button("Download elemental results (xlsx)", data=out.getvalue(),
-                       file_name="TD_iteration_results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.markdown("### Iteration trace (first 12 rows)")
+    st.dataframe(df_itr.head(12), use_container_width=True)
 
     st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. Defaults: last casing 9-5/8, OH 8.50 in. "
                "Tools include history-matching μ, calibrated overlay, NP check, 0.8×MU gate, BSR/SR, tortuosity penalty, motor bit torque, "
-               "and rig-limit margins. Rotating off-bottom HL = average(PU, SO).")
+               "and rig-limit margins, per lectures.")

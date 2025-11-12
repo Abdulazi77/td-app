@@ -423,7 +423,8 @@ for tab, mu in zip(tabs, mu_list):
         for mcode, mlabel in motions:
             df[f"{mlabel} tension (lb)"] = results[mu][mcode]["tension_lb"]
         fig = px.line(df, x="MD (ft)", y=[c for c in df.columns if c.endswith("(lb)")])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"torque-{idx}")
+        
 
 st.subheader("3) Torque Profile — Surface & Downhole Torque vs Depth (per μ)")
 tabs2 = st.tabs([f"μ = {mu:.2f}" for mu in mu_list])
@@ -436,7 +437,7 @@ for tab, mu in zip(tabs2, mu_list):
             "Torque — rotating (ft-lbf)": results[mu]["rotating"]["torque_ftlbf"],
         })
         fig = px.line(df, x="MD (ft)", y=df.columns[1:])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig_prof, use_container_width=True, key="prof")
 
 st.subheader("4) Buckling Envelope — Critical Loads and Buckled Zones")
 st.caption("Shows effective sinusoidal/helical critical loads (with rotation factor if applicable) and where the string is predicted to buckle.")
@@ -456,7 +457,7 @@ for tab, mu in zip(tabs3, mu_list):
             "F_hel, eff (lb)": Fhel,
         })
         fig = px.line(df, x="MD (ft)", y=["Compression (lb)", "F_sin, eff (lb)", "F_hel, eff (lb)"])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig_prof, use_container_width=True, key="prof")
 
         # highlight buckled intervals
         buck = results[mu]["rotating"]["buckling_state"]

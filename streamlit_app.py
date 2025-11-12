@@ -160,7 +160,13 @@ def soft_string_stepper(
         T[0] = -float(WOB_lbf)       # compressive at bit
         M[0] = float(Mbit_ftlbf)     # motor / bit torque allowed
 
-    sgn_ax = {"pickup": +1.0, "slackoff": -1.0}.get(scenario, 0.0)
+    # axial sign convention
+    if scenario in ("pickup",):
+        sgn_ax = +1.0     # pulling out of hole
+    elif scenario in ("slackoff", "onbottom"):
+        sgn_ax = -1.0     # running in / weight downwards
+    else:  # "rotate_off"
+        sgn_ax = 0.0
 
     for i in range(nseg):
         N_side[i] = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
@@ -231,9 +237,12 @@ def grid_calibrate_mu(
                             mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg,
                             scenario=scen, WOB_lbf=0.0, Mbit_ftlbf=0.0
                         )
-                        HL = max(0.0, -T_tmp[-1])
-                        if scen == "pickup":   err2 += (HL - measured_pickup_hl)**2
-                        if scen == "slackoff": err2 += (HL - measured_slackoff_hl)**2
+                        # use magnitude of surface axial force as hookload
+                        HL = abs(T_tmp[-1])
+                        if scen == "pickup" and measured_pickup_hl is not None:
+                            err2 += (HL - measured_pickup_hl)**2
+                        if scen == "slackoff" and measured_slackoff_hl is not None:
+                            err2 += (HL - measured_slackoff_hl)**2
                         if scen == "rotate_off" and measured_rotate_hl is not None:
                             err2 += (HL - measured_rotate_hl)**2
                         if measured_surface_torque is not None:
@@ -406,7 +415,9 @@ with tab:
     )
 
     depth = df_itr["md_bot_ft"].to_numpy()
-    surf_hookload = max(0.0, -T_arr[-1]); surf_torque = abs(M_arr[-1])
+    # Hookload = magnitude of surface axial force
+    surf_hookload = abs(T_arr[-1])
+    surf_torque = abs(M_arr[-1])
     st.success(f"Surface hookload: {surf_hookload:,.0f} lbf — Surface torque: {surf_torque:,.0f} lbf-ft")
 
     # ───────── Safety & limits
@@ -477,7 +488,8 @@ with tab:
     if simple_mode:
         figT = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["M_next_lbf_ft"]), mode="lines", name="Torque"))
         figT.update_xaxes(title_text="MD (ft)"); figT.update_yaxes(title_text="Torque (lbf-ft)")
-        figH = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.maximum(0.0, -df_itr["T_next_lbf"]), mode="lines", name="Hookload"))
+        # Hookload magnitude vs depth
+        figH = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["T_next_lbf"]), mode="lines", name="Hookload"))
         figH.update_xaxes(title_text="MD (ft)"); figH.update_yaxes(title_text="Hookload (lbf)")
         c1x, c2x = st.columns(2)
         with c1x: st.plotly_chart(figT, use_container_width=True)
@@ -532,6 +544,7 @@ with tab:
             mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot, mw_ppg,
             scenario="pickup", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
         )
+        # tension only (compression taken as zero) for combined-load check
         F_ax = np.maximum(0.0, df_pick["T_next_lbf"].to_numpy())
         T_allow = T_yield_sf * np.sqrt(np.clip(1.0 - (F_ax/np.maximum(F_tensile_sf,1.0))**2, 0.0, 1.0))
         fig_right.add_trace(go.Scatter(x=T_allow/1000.0, y=df_pick["md_bot_ft"].to_numpy(), mode="lines",
@@ -574,7 +587,8 @@ with tab:
         fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
 
         fig_hl = go.Figure()
-        fig_hl.add_trace(go.Scatter(x=np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())/1000.0, y=depth,
+        # Hookload magnitude vs depth
+        fig_hl.add_trace(go.Scatter(x=np.abs(df_itr['T_next_lbf'].to_numpy())/1000.0, y=depth,
                                     mode="lines", name="Hookload"))
         fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
         fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))

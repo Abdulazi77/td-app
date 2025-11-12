@@ -323,36 +323,36 @@ with st.sidebar:
     st.header("Well Path (choose one)")
 
     profile = st.selectbox("Profile", ["Build & Hold", "Build & Hold & Drop", "Horizontal + Lateral"])
-    md_total = st.number_input("Total MD (ft)", 12000, min_value=1000, step=500)
-    step_ft = st.number_input("Step (ft) — use 1 as required", 1, 1, 50)  # :contentReference[oaicite:18]{index=18}
+    md_total = st.number_input("Total MD (ft)", value=12000, min_value=1000, step=500)
+    step_ft  = st.number_input("Step (ft) — use 1 as required", value=1, min_value=1, max_value=50)
 
-    md_kop = st.number_input("KOP (ft)", 2000, 0, 30000, step=100)
-    build_rate = st.number_input("Build rate (deg/100 ft)", 8.0, 0.0, 30.0, step=0.5)
-    target_inc = st.number_input("Target inclination (deg)", 60.0, 0.0, 90.0, step=1.0)
+    md_kop     = st.number_input("KOP (ft)", value=2000, min_value=0, max_value=30000, step=100)
+    build_rate = st.number_input("Build rate (deg/100 ft)", value=8.0, min_value=0.0, max_value=30.0, step=0.5)
+    target_inc = st.number_input("Target inclination (deg)", value=60.0, min_value=0.0, max_value=90.0, step=1.0)
 
     md_eoc = 0; drop_rate = 0.0; lateral_len = 0
     if profile == "Build & Hold & Drop":
-        md_eoc = st.number_input("End of Hold (start Drop) MD (ft)", 8000, 0, 50000, step=100)
-        drop_rate = st.number_input("Drop rate (deg/100 ft)", 8.0, 0.0, 30.0, step=0.5)
+        md_eoc    = st.number_input("End of Hold (start Drop) MD (ft)", value=8000, min_value=0, max_value=50000, step=100)
+        drop_rate = st.number_input("Drop rate (deg/100 ft)", value=8.0, min_value=0.0, max_value=30.0, step=0.5)
     elif profile == "Horizontal + Lateral":
-        lateral_len = st.number_input("Lateral length (ft)", 2000, 0, 20000, step=100)
+        lateral_len = st.number_input("Lateral length (ft)", value=2000, min_value=0, max_value=20000, step=100)
 
     st.markdown("---")
     st.subheader("Drilling Parameters")
-    mud_ppg = st.number_input("Mud weight (ppg)", 10.0, 5.0, 20.0, step=0.1)
+    mud_ppg = st.number_input("Mud weight (ppg)", value=10.0, min_value=5.0, max_value=20.0, step=0.1)
 
     st.markdown("**Friction**")
     mu_csv = st.text_input("Sliding friction μ (comma-sep; ≥3 values)", "0.20,0.30,0.40")
     mu_list = [max(0.0, min(1.0, float(x.strip()))) for x in mu_csv.split(",") if x.strip()]
-    mu_rot_factor = st.slider("Rotating μ reduction factor", 0.1, 1.0, 0.30, 0.05)
+    mu_rot_factor = st.slider("Rotating μ reduction factor", min_value=0.1, max_value=1.0, value=0.30, step=0.05)
 
-    wob_klbf = st.number_input("WOB (klbf) [optional]", 0.0, 0.0, 500.0, step=1.0)
-    bit_torque = st.number_input("Bit torque (ft-lbf) [optional]", 0.0, 0.0, 100000.0, step=100.0)
+    wob_klbf   = st.number_input("WOB (klbf) [optional]", value=0.0, min_value=0.0, max_value=500.0, step=1.0)
+    bit_torque = st.number_input("Bit torque (ft-lbf) [optional]", value=0.0, min_value=0.0, max_value=100000.0, step=100.0)
 
     st.markdown("---")
     st.subheader("Buckling Parameters")
-    lam_hel = st.slider("λ for helical critical load (2.83–5.65)", 2.83, 5.65, 2.83, 0.01)  # :contentReference[oaicite:19]{index=19}
-    rot_crit_factor = st.slider("Rotating critical-load factor (≈0.78)", 0.5, 1.0, 0.78, 0.01)  # :contentReference[oaicite:20]{index=20}
+    lam_hel = st.slider("λ for helical critical load (2.83–5.65)", min_value=2.83, max_value=5.65, value=2.83, step=0.01)
+    rot_crit_factor = st.slider("Rotating critical-load factor (≈0.78)", min_value=0.5, max_value=1.0, value=0.78, step=0.01)
 
     st.markdown("---")
     st.subheader("Drillstring Assembly (from bit up)")
@@ -371,6 +371,7 @@ with st.sidebar:
         {"top_ft":0, "bot_ft":md_total, "hole_d_in":8.5, "casing_id_in":0.0},
     ])
     hole_table = st.data_editor(default_hole, num_rows="dynamic", use_container_width=True)
+
 
 # Build trajectory
 if profile == "Build & Hold":

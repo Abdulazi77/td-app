@@ -446,3 +446,4 @@ with tab:
     st.dataframe(df_itr.head(12), use_container_width=True)
 
     st.caption("Johancsik soft-string (Δs=1 ft) with enhanced buckling & severity visuals. Includes history-match μ overlay, NP check, 0.8×MU gate, BSR/SR, tortuosity, motor bit torque, rig limits, and stacked severity plots.")
+ 

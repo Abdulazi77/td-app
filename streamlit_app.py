@@ -26,7 +26,7 @@ fig.add_trace(go.Scatter(x=df_itr['N_lbf']/1000.0, y=depth, name="Side-force (k-
 fig.add_trace(go.Scatter(x=sigma_b_psi/1000.0, y=depth, name="Bending (ksi)"),             row=3, col=1)
 fig.add_trace(go.Scatter(x=sigma_vm_psi/1000.0, y=depth, name="von Mises (ksi)"),          row=3, col=1)
 fig.add_trace(go.Scatter(x=BSI, y=depth, name="BSI (1–4)", line=dict(width=4)),            row=3, col=1)
-
+ 
 # Axis labels, formatting
 for r in (1,2,3):
     fig.update_yaxes(autorange="reversed", title_text="Depth (ft)", row=r, col=1)

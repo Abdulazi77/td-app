@@ -3,18 +3,14 @@
 """
 PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
 Single-tab linked workflow with calibration, NP, 0.8×MU, BSR/SR, tortuosity, motor-BT,
-rig-limit margins, and hole-cleaning booster.
+rig-limit margins, hole-cleaning booster, and calibrated μ overlay (dashed).
 
-Libraries needed (requirements.txt):
-  streamlit
-  plotly
-  numpy
-  pandas
+Libraries needed: streamlit, plotly, numpy, pandas
 """
 
 from __future__ import annotations
 import math
-from typing import Dict, Iterable, Tuple, Optional
+from typing import Dict, Iterable, Tuple, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,17 +26,13 @@ IN2FT   = 1.0/12.0
 
 def clamp(x: float, lo: float, hi: float) -> float: return max(lo, min(hi, x))
 def bf_from_mw(mw_ppg: float) -> float: return (65.5 - mw_ppg)/65.5  # steel ~65.5 ppg
-
-def I_in4(od_in: float, id_in: float) -> float:
-    return (math.pi/64.0)*(od_in**4 - id_in**4)
-
-def Z_in3(od_in: float, id_in: float) -> float:
-    return I_in4(od_in, id_in) / (od_in/2.0)
+def I_in4(od_in: float, id_in: float) -> float: return (math.pi/64.0)*(od_in**4 - id_in**4)
+def Z_in3(od_in: float, id_in: float) -> float: return I_in4(od_in, id_in) / (od_in/2.0)
 
 # ────────────────────── Minimal standards DBs ───────────────────
 CASING_DB = {
     "13-3/8": {"weights": {48.0: 12.415, 54.5: 12.347, 61.0: 12.107}},
-    "9-5/8":  {"weights": {29.3: 8.921, 36.0: 8.535, 40.0: 8.321}},   # default
+    "9-5/8":  {"weights": {29.3: 8.921, 36.0: 8.535, 40.0: 8.321}},
     "7":      {"weights": {20.0: 6.366, 23.0: 6.059, 26.0: 5.920}},
     "5-1/2":  {"weights": {17.0: 4.778, 20.0: 4.670, 23.0: 4.560}},
 }
@@ -194,7 +186,6 @@ def soft_string_stepper(
 def neutral_point_md(md: np.ndarray, T_arr: np.ndarray) -> float:
     """Return MD where axial force crosses zero (bit→surface array). NaN if none."""
     if len(md) < 2 or len(T_arr) < 2: return float('nan')
-    # sign change search in segments (T_arr index 0 at bit)
     for i in range(len(T_arr)-1):
         t1, t2 = T_arr[i], T_arr[i+1]
         if t1 == 0: return md[i]
@@ -210,11 +201,7 @@ def grid_calibrate_mu(
     measured_rotate_hl: Optional[float], measured_surface_torque: Optional[float],
     mu_ranges: Dict[str, Tuple[float,float,float]],
 ):
-    """
-    Very simple grid search across μ ranges:
-      mu_c_s, mu_o_s, mu_c_r, mu_o_r
-    Returns dict with best μ and residuals (None if not enough measurements).
-    """
+    """Very simple grid search across μ ranges; returns best μ dict or None."""
     targets = []
     if measured_pickup_hl is not None:   targets.append("pickup")
     if measured_slackoff_hl is not None: targets.append("slackoff")
@@ -228,7 +215,7 @@ def grid_calibrate_mu(
     comp_fit  = np.asarray(list(comp_along))[:len(md_fit)-1]
 
     best = None; best_err = 1e99
-    mu_c_s_rng = np.arange(*mu_ranges["mu_c_s"])  # (start, stop, step)
+    mu_c_s_rng = np.arange(*mu_ranges["mu_c_s"])
     mu_o_s_rng = np.arange(*mu_ranges["mu_o_s"])
     mu_c_r_rng = np.arange(*mu_ranges["mu_c_r"])
     mu_o_r_rng = np.arange(*mu_ranges["mu_o_r"])
@@ -261,6 +248,7 @@ def grid_calibrate_mu(
 
 with tab:
     st.header("Wellpath + Torque & Drag (Δs = 1 ft) — Linked")
+
     # ───────── Trajectory
     st.subheader("Trajectory & 3D schematic (Minimum Curvature)")
     c1, c2, c3, c4 = st.columns(4)
@@ -304,7 +292,7 @@ with tab:
     shoe_md = float(st.session_state['shoe_md'])
     cased_mask = md <= shoe_md
 
-    # ───────── 3D split by shoe (depth down)
+    # ───────── 3D split by shoe
     idx = int(np.searchsorted(md, shoe_md, side='right'))
     fig3d = go.Figure()
     if idx > 1:
@@ -339,7 +327,6 @@ with tab:
 
     # ───────── T&D Inputs
     st.subheader("Soft-string Torque & Drag — Johancsik (linked to survey above)")
-    # typical μ ranges for quick reference
     with st.expander("Typical μ starting ranges (lecture hints)"):
         st.markdown("""
 - **Casing (WBM):** 0.15 – 0.25 (sliding/rotating similar)  
@@ -459,7 +446,7 @@ with tab:
         if not in_DCs:
             st.warning("Increase DC length so NP sits inside the collars for current WOB.")
 
-    # BSR & SR quick checks at connections
+    # BSR & SR quick checks
     st.subheader("Connection checks — BSR & SR (rule-of-thumb)")
     Z_dp, Z_h, Z_dc = Z_in3(dp_od, dp_id), Z_in3(hwdp_od, hwdp_id), Z_in3(dc_od, dc_id)
     I_dp, I_h, I_dc = I_in4(dp_od, dp_id), I_in4(hwdp_od, hwdp_id), I_in4(dc_od, dc_id)
@@ -473,19 +460,29 @@ with tab:
     c3m.metric("SR DP→HWDP", f"{SR_dp_h:.2f}", help="Stiffness Ratio (I ratio). Big jumps (>~1.4) raise twist-off risk.")
     c4m.metric("SR HWDP→DC", f"{SR_h_dc:.2f}")
 
-    # ───────── Classic/simple toggle & plots
+    # ───────── Classic/simple toggle
     simple_mode = st.checkbox("Use classic simple view (hide safety overlays & μ-sweep)", value=False)
+
+    # ───────── Overlay toggle for calibrated μ curves
+    overlay_calibrated = False
+    mu_fit = st.session_state.get("μ_fit")
+    if mu_fit is not None and not simple_mode:
+        overlay_calibrated = st.checkbox("Overlay calibrated μ curves (dashed)", value=True)
+        if overlay_calibrated:
+            st.caption(
+                f"Overlay uses fitted μ: casing(slide)={mu_fit['mu_c_s']:.2f}, open(slide)={mu_fit['mu_o_s']:.2f}, "
+                f"casing(rot)={mu_fit['mu_c_r']:.2f}, open(rot)={mu_fit['mu_o_r']:.2f}"
+            )
 
     if simple_mode:
         figT = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["M_next_lbf_ft"]), mode="lines", name="Torque"))
         figT.update_xaxes(title_text="MD (ft)"); figT.update_yaxes(title_text="Torque (lbf-ft)")
         figH = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.maximum(0.0, -df_itr["T_next_lbf"]), mode="lines", name="Hookload"))
         figH.update_xaxes(title_text="MD (ft)"); figH.update_yaxes(title_text="Hookload (lbf)")
-        c1p, c2p = st.columns(2)
-        with c1p: st.plotly_chart(figT, use_container_width=True)
-        with c2p: st.plotly_chart(figH, use_container_width=True)
+        c1x, c2x = st.columns(2)
+        with c1x: st.plotly_chart(figT, use_container_width=True)
+        with c2x: st.plotly_chart(figH, use_container_width=True)
     else:
-        # μ sweep (left plot)
         st.markdown("### T&D Model Chart — Risk curves and limits")
         mu_band = st.multiselect("μ sweep for off-bottom risk curves", [0.15,0.20,0.25,0.30,0.35,0.40], default=[0.20,0.25,0.30,0.35])
 
@@ -493,18 +490,18 @@ with tab:
         T_yield_sf  = TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint
         F_tensile_sf= TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension
 
-        def run_td_off_bottom(mu):
-            df_tmp, _, _ = soft_string_stepper(
+        def run_td_off_bottom(mu_slide: float, mu_rot: float):
+            df_tmp, T_tmp, M_tmp = soft_string_stepper(
                 md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-                mu, mu, mu, mu, mw_ppg, scenario="rotate_off",
+                mu_slide, mu_slide, mu_rot, mu_rot, mw_ppg, scenario="rotate_off",
                 tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
             )
             return df_tmp["md_bot_ft"].to_numpy(), np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
 
-        # LEFT: off-bottom torque vs depth risk curves
+        # LEFT: μ-sweep off-bottom torque vs depth
         fig_left = go.Figure()
         for mu in mu_band:
-            dmu, tmu = run_td_off_bottom(mu)
+            dmu, tmu = run_td_off_bottom(mu, mu)
             fig_left.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines"))
         fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
                            annotation_text="Make-up / SF")
@@ -512,26 +509,25 @@ with tab:
         fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)")
         fig_left.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
 
-        # RIGHT: elemental + limits, with section labels
+        # overlay calibrated (off-bottom)
+        if overlay_calibrated:
+            dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
+            fig_left.add_trace(
+                go.Scatter(x=tcal/1000.0, y=dcal, mode="lines",
+                           name="μ (calibrated, off-bottom)", line=dict(dash="dash"))
+            )
+
+        # RIGHT: elemental torque + limits
         fig_right = go.Figure()
         for mu in mu_band:
-            dmu, tmu = run_td_off_bottom(mu)
-            if tmu[0] < tmu[-1]: tmu = tmu[::-1]  # make curves look like "elemental"
+            dmu, tmu = run_td_off_bottom(mu, mu)
+            if tmu[0] < tmu[-1]: tmu = tmu[::-1]
             fig_right.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines"))
-
-        # Section bands/labels (from surface)
-        dp_top, dp_bot = 0.0, dp_len
-        hwdp_top, hwdp_bot = dp_bot, dp_bot + hwdp_len
-        dc_top, dc_bot = hwdp_bot, hwdp_bot + dc_len
-        fig_right.add_hrect(y0=dp_top, y1=dp_bot, line_width=0, annotation_text="DP", annotation_position="top left", opacity=0.0)
-        fig_right.add_hrect(y0=hwdp_top, y1=hwdp_bot, line_width=0, annotation_text="HWDP", annotation_position="top left", opacity=0.0)
-        fig_right.add_hrect(y0=dc_top, y1=dc_bot, line_width=0, annotation_text="DC", annotation_position="top left", opacity=0.0)
-
         fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
         fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
 
-        # combined load limit using pickup tension
-        df_pick, _, _ = soft_string_stepper(
+        # combined load using pickup tension
+        df_pick, T_pick, M_pick = soft_string_stepper(
             md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
             mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot, mw_ppg,
             scenario="pickup", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
@@ -544,6 +540,15 @@ with tab:
         fig_right.update_xaxes(title_text="Elemental torque (k lbf-ft)")
         fig_right.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
 
+        # overlay calibrated (elemental style off-bottom)
+        if overlay_calibrated:
+            dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
+            if tcal[0] < tcal[-1]: tcal = tcal[::-1]
+            fig_right.add_trace(
+                go.Scatter(x=tcal/1000.0, y=dcal, mode="lines",
+                           name="μ (calibrated, elemental)", line=dict(dash="dash"))
+            )
+
         cL, cR = st.columns(2)
         with cL: st.plotly_chart(fig_left, use_container_width=True)
         with cR: st.plotly_chart(fig_right, use_container_width=True)
@@ -553,17 +558,15 @@ with tab:
         Iin4_dp = I_in4(dp_od, dp_id)
         rbore_ft = 0.5*hole_diam_in*IN2FT; rpipe_ft = 0.5*dp_od*IN2FT
         clearance_ft = max(1e-3, rbore_ft - rpipe_ft)
-        # sinusoidal/helical thresholds (rule-of-thumb)
         theta = np.deg2rad(np.maximum(0.0, df_itr['inc_deg'].to_numpy()))
         Fs = 2.0*np.sqrt(Epsi*Iin4_dp * df_itr['w_b_lbft'].to_numpy()*np.sin(theta)/clearance_ft)
         Fh = 1.6*Fs
 
         fig_env = go.Figure()
-        # ellipse-like envelope using tensile & torsional limits
         F_env = np.linspace(0, TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension, 100)
-        T_env = (TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint) * np.sqrt(np.clip(1.0 - (F_env/np.maximum(F_env.max(),1.0))**2, 0.0, 1.0))
+        T_env = (TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint)*np.sqrt(np.clip(1.0 - (F_env/np.maximum(F_env.max(),1.0))**2, 0.0, 1.0))
         fig_env.add_trace(go.Scatter(x=T_env/1000.0, y=F_env/1000.0, mode="lines", name="API 7G envelope (approx)"))
-        fig_env.add_vline(x=(0.8*T_makeup)/1000.0, line_color="#00d5ff", line_dash="dash", annotation_text="0.8×MU")
+        fig_env.add_vline(x=0.8*T_makeup/1000.0, line_color="#00d5ff", line_dash="dash", annotation_text="0.8×MU")
         fig_env.add_trace(go.Scatter(x=[surf_torque/1000.0], y=[surf_hookload/1000.0], mode="markers",
                                      name="Operating point", marker=dict(size=10, color="orange")))
         fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
@@ -579,9 +582,9 @@ with tab:
         fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_hl.update_xaxes(title_text="Force / Hookload (k lbf)")
         fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
-        c3d, c4d = st.columns(2)
-        with c3d: st.plotly_chart(fig_env, use_container_width=True)
-        with c4d: st.plotly_chart(fig_hl,  use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3: st.plotly_chart(fig_env, use_container_width=True)
+        with c4: st.plotly_chart(fig_hl,  use_container_width=True)
 
     # ───────── Friction calibration (history match)
     st.subheader("Friction calibration (history match at a depth)")
@@ -597,7 +600,7 @@ with tab:
         mu_c_s_rng = cA.text_input("μ_casing_slide: start,stop,step", "0.15,0.35,0.05")
         mu_o_s_rng = cB.text_input("μ_open_slide: start,stop,step", "0.25,0.45,0.05")
         mu_c_r_rng = cC.text_input("μ_casing_rot: start,stop,step", "0.15,0.35,0.05")
-        mu_o_r_rng = cD.text_input("μ_open_rot: start,stop,step", "0.25,0.45,0.05")
+        mu_o_r_rng = cD.text_input("μ_open_rot: start,stop,step", "0.20,0.40,0.05")
 
     if st.button("Run μ calibration (grid search)"):
         try:
@@ -618,9 +621,10 @@ with tab:
             if best is None:
                 st.warning("Provide at least one measurement (pickup/slackoff/rotate).")
             else:
+                st.session_state["μ_fit"] = best
                 st.success(f"Fitted μ: casing(slide)={best['mu_c_s']:.2f}, open(slide)={best['mu_o_s']:.2f}, "
                            f"casing(rot)={best['mu_c_r']:.2f}, open(rot)={best['mu_o_r']:.2f} (SSE={best['SSE']:.1f})")
-                st.caption("Copy the values into the inputs above (or save them externally).")
+                st.caption("Use the overlay toggle above to compare baseline vs calibrated curves; or copy values into inputs and re-run.")
         except Exception as e:
             st.error(f"Calibration failed: {e}")
 
@@ -628,5 +632,5 @@ with tab:
     st.dataframe(df_itr.head(12), use_container_width=True)
 
     st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. Defaults: last casing 9-5/8, OH 8.50 in. "
-               "Tools include history-matching μ, NP check, 0.8×MU gate, BSR/SR, tortuosity penalty, motor bit torque, "
+               "Tools include history-matching μ, calibrated overlay, NP check, 0.8×MU gate, BSR/SR, tortuosity penalty, motor bit torque, "
                "and rig-limit margins (per lecture).")

@@ -243,25 +243,6 @@ def grid_calibrate_mu(
                         best = dict(mu_c_s=mu_c_s, mu_o_s=mu_o_s, mu_c_r=mu_c_r, mu_o_r=mu_o_r, SSE=best_err)
     return best
 
-# ──────────────────── Buckling helpers (minimal) ─────────────────
-def EI_lbf_ft2_from_in4(Epsi_lbf_in2: float, I_in4_val: float) -> float:
-    """E[lbf/in^2]*I[in^4] -> EI[lbf·in^2] -> lbf·ft^2."""
-    EI_lbf_in2 = Epsi_lbf_in2 * I_in4_val
-    return EI_lbf_in2 / (12.0**2)
-
-def critical_loads(Fw_lbft: np.ndarray, inc_deg: np.ndarray, r_ft: float,
-                   EI_lbf_ft2: float, lam_hel: float = 2.83, rot_factor: float = 1.0):
-    """
-    Classic thresholds:
-      F_sin = (2 EI ω)/(r sin Inc),  F_hel = (λ EI ω)/(r sin Inc)
-    Apply rot_factor (<1) to reflect rotation lowering the critical loads.
-    """
-    inc_rad = np.deg2rad(np.maximum(inc_deg, 1e-9))
-    denom = np.maximum(r_ft * np.sin(inc_rad), 1e-9)
-    Fsin = (2.0 * EI_lbf_ft2 * Fw_lbft) / denom
-    Fhel = (lam_hel * EI_lbf_ft2 * Fw_lbft) / denom
-    return Fsin * rot_factor, Fhel * rot_factor
-
 # ─────────────────────────────── UI ──────────────────────────────
 (tab,) = st.tabs(["Wellpath + Torque & Drag (linked)"])
 
@@ -324,7 +305,7 @@ with tab:
         xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
         zaxis=dict(autorange="reversed")
     ), legend=dict(orientation="h"), margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig3d, use_container_width=True, key="path-3d")
+    st.plotly_chart(fig3d, use_container_width=True)
 
     # 2D TVD-VS
     st.subheader("2D Wellbore Profile — TVD vs Vertical Section")
@@ -336,7 +317,7 @@ with tab:
     fig2d.update_layout(xaxis_title="Vertical Section (ft)", yaxis_title="TVD (ft)",
                         yaxis=dict(autorange="reversed"), height=360, legend=dict(orientation="h"),
                         margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig2d, use_container_width=True, key="tvd-vs")
+    st.plotly_chart(fig2d, use_container_width=True)
 
     st.dataframe(pd.DataFrame({
         "MD (ft)": md[:11], "Inc (deg)": inc_deg[:11], "Az (deg)": az[:11],
@@ -499,8 +480,8 @@ with tab:
         figH = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.maximum(0.0, -df_itr["T_next_lbf"]), mode="lines", name="Hookload"))
         figH.update_xaxes(title_text="MD (ft)"); figH.update_yaxes(title_text="Hookload (lbf)")
         c1x, c2x = st.columns(2)
-        with c1x: st.plotly_chart(figT, use_container_width=True, key="simple-torque")
-        with c2x: st.plotly_chart(figH, use_container_width=True, key="simple-hook")
+        with c1x: st.plotly_chart(figT, use_container_width=True)
+        with c2x: st.plotly_chart(figH, use_container_width=True)
     else:
         st.markdown("### T&D Model Chart — Risk curves and limits")
         mu_band = st.multiselect("μ sweep for off-bottom risk curves", [0.15,0.20,0.25,0.30,0.35,0.40], default=[0.20,0.25,0.30,0.35])
@@ -569,32 +550,17 @@ with tab:
             )
 
         cL, cR = st.columns(2)
-        with cL: st.plotly_chart(fig_left, use_container_width=True, key="risk-left")
-        with cR: st.plotly_chart(fig_right, use_container_width=True, key="risk-right")
+        with cL: st.plotly_chart(fig_left, use_container_width=True)
+        with cR: st.plotly_chart(fig_right, use_container_width=True)
 
         # Envelope & Hookload diagnostics
         Epsi = 30.0e6
         Iin4_dp = I_in4(dp_od, dp_id)
         rbore_ft = 0.5*hole_diam_in*IN2FT; rpipe_ft = 0.5*dp_od*IN2FT
-        clearance_ft = max(1e-4, rbore_ft - rpipe_ft)  # keep >0
-
+        clearance_ft = max(1e-3, rbore_ft - rpipe_ft)
         theta = np.deg2rad(np.maximum(0.0, df_itr['inc_deg'].to_numpy()))
-
-        # >>>>>>>>>>> MINIMAL BUCKLING REPLACEMENT STARTS HERE <<<<<<<<<<
-        # Proper sinusoidal/helical thresholds with rotation factor (0.78 if rotating)
-        rot_factor = 0.78 if "rotate" in scenario else 1.00
-        lam_hel_ui = 2.83  # keep constant (or promote to slider if desired)
-        EI_dp_lbf_ft2 = EI_lbf_ft2_from_in4(Epsi, Iin4_dp)
-
-        Fs, Fh = critical_loads(
-            Fw_lbft=df_itr['w_b_lbft'].to_numpy(),
-            inc_deg=df_itr['inc_deg'].to_numpy(),
-            r_ft=clearance_ft,
-            EI_lbf_ft2=EI_dp_lbf_ft2,
-            lam_hel=lam_hel_ui,
-            rot_factor=rot_factor
-        )
-        # >>>>>>>>>>> MINIMAL BUCKLING REPLACEMENT ENDS HERE <<<<<<<<<<
+        Fs = 2.0*np.sqrt(Epsi*Iin4_dp * df_itr['w_b_lbft'].to_numpy()*np.sin(theta)/clearance_ft)
+        Fh = 1.6*Fs
 
         fig_env = go.Figure()
         F_env = np.linspace(0, TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension, 100)
@@ -617,8 +583,8 @@ with tab:
         fig_hl.update_xaxes(title_text="Force / Hookload (k lbf)")
         fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
         c3, c4 = st.columns(2)
-        with c3: st.plotly_chart(fig_env, use_container_width=True, key="env")
-        with c4: st.plotly_chart(fig_hl,  use_container_width=True, key="hookload")
+        with c3: st.plotly_chart(fig_env, use_container_width=True)
+        with c4: st.plotly_chart(fig_hl,  use_container_width=True)
 
     # ───────── Friction calibration (history match)
     st.subheader("Friction calibration (history match at a depth)")

@@ -10,7 +10,7 @@ Needs: streamlit, plotly, numpy, pandas
 
 from __future__ import annotations
 import math
-from typing import Dict, Iterable, Tuple, List, Optional
+from typing import Dict, Iterable, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -116,7 +116,6 @@ def soft_string_stepper(
     """
     Δs = 1 ft soft-string integration, bit -> surface.
     scenario: "pickup" | "slackoff" | "rotate_off" | "onbottom"
-    tortuosity_mode: inflate kappa or mu by (1+tau) in OPEN-HOLE segments.
     """
     ds = 1.0
     md = np.asarray(md); inc_deg = np.asarray(inc_deg)
@@ -147,7 +146,6 @@ def soft_string_stepper(
             mu_s[i] = mu_slide_open + mu_open_boost
             mu_r[i] = mu_rot_open   + mu_open_boost
 
-        # tortuosity penalties (Menand highlights tortuosity & micro-DLs)
         if not cased_seg[i]:
             if tortuosity_mode == "kappa":
                 kappa_seg[i] *= (1.0 + tau)
@@ -157,7 +155,6 @@ def soft_string_stepper(
     T = np.zeros(nseg+1); M = np.zeros(nseg+1)   # axial tension, torque
     dT = np.zeros(nseg);  dM = np.zeros(nseg);   N_side = np.zeros(nseg)
 
-    # boundary condition
     if scenario == "onbottom":
         T[0] = -float(WOB_lbf)       # compressive at bit
         M[0] = float(Mbit_ftlbf)     # motor / bit torque allowed
@@ -166,9 +163,7 @@ def soft_string_stepper(
 
     for i in range(nseg):
         N_side[i] = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
-        # axial
         T_next = T[i] + (sgn_ax*w_b[i]*math.cos(inc[i]) + mu_s[i]*N_side[i])*ds
-        # torque
         M_next = M[i] + (mu_r[i]*N_side[i]*r_eff_ft[i])*ds
         dT[i] = T_next - T[i]; dM[i] = M_next - M[i]
         T[i+1] = T_next; M[i+1] = M_next
@@ -251,7 +246,7 @@ def EI_lbf_ft2_from_in4(Epsi_lbf_in2: float, I_in4_val: float) -> float:
 def critical_loads(Fw_lbft: np.ndarray, inc_deg: np.ndarray, r_ft: float,
                    EI_lbf_ft2: float, lam_hel: float = 2.83, rot_factor: float = 1.0):
     """
-    Classic thresholds (Menand discusses k-range and rotation / friction effects on Fc).
+    Classic thresholds (Menand shows k ~ 2.83 onset; ~5.65 full helix; rotation lowers Fc).
     F_sin = (2 EI ω)/(r sin Inc),  F_hel = (λ EI ω)/(r sin Inc)
     """
     inc_rad = np.deg2rad(np.maximum(inc_deg, 1e-9))
@@ -306,7 +301,6 @@ with tab:
     st.session_state['shoe_md'] = cc4.slider("Shoe MD (ft)", 0.0, md_end, float(st.session_state['shoe_md']), 50.0)
 
     hole_diam_in = cc5.number_input("Open-hole diameter (in)", 4.0, 20.0, 8.50, 0.01)
-    # NEW: rotation over-gage (reduces Fc during rotation by increasing r)
     overgage_rot_in = st.slider("Hole over-gage when rotating (in)", 0.0, 1.0, 0.25, 0.05)
     shoe_md = float(st.session_state['shoe_md'])
     cased_mask = md <= shoe_md
@@ -349,8 +343,8 @@ with tab:
     with st.expander("Typical μ starting ranges (lecture hints)"):
         st.markdown("""
 - **Casing (WBM):** 0.15 – 0.25  
-- **Open-hole (WBM):** 0.25 – 0.40 (can be higher with poor cleaning)  
-> Use history matching to calibrate.
+- **Open-hole (WBM):** 0.25 – 0.40 (↑ if cleaning poor)  
+> Calibrate with history match.
 """)
 
     mu_cased_slide = st.number_input("μ in casing (sliding)", 0.05, 0.80, 0.25, 0.01)
@@ -359,14 +353,14 @@ with tab:
     mu_open_rot    = st.number_input("μ in open-hole (rotating)", 0.05, 0.80, 0.35, 0.01)
     mw_ppg         = st.number_input("Mud weight (ppg)", 7.0, 20.0, 10.0, 0.1)
 
-    # NEW: rotation critical-load reduction (Menand notes ~50% possible)
-    rot_fc_factor  = st.slider("Rotation reduction factor on critical loads Fc", 0.4, 1.0, 0.5, 0.01)
+    # Menand: rotation can ~halve Fc; expose reduction factor
+    rot_fc_factor  = st.slider("Rotation reduction factor on Fc", 0.4, 1.0, 0.5, 0.01)
 
     hc1, hc2 = st.columns(2)
     cleaning_mode = hc1.selectbox("Hole-cleaning condition (open-hole μ booster)", ["Good (0)", "Fair (+0.03)", "Poor (+0.08)"], index=0)
     mu_boost = {"Good (0)":0.0, "Fair (+0.03)":0.03, "Poor (+0.08)":0.08}[cleaning_mode]
     tort_mode = hc2.selectbox("Tortuosity penalty mode", ["off", "kappa", "mu"], index=0)
-    tau = st.slider("Penalty factor τ (for open-hole only)", 0.0, 0.5, 0.2, 0.05) if tort_mode != "off" else 0.0
+    tau = st.slider("Penalty factor τ (open-hole only)", 0.0, 0.5, 0.2, 0.05) if tort_mode != "off" else 0.0
 
     st.markdown("**Drillstring (bit up)**")
     d1, d2, d3 = st.columns(3)
@@ -448,7 +442,7 @@ with tab:
     passed_80 = torque_margin >= 0
     st.info(f"0.8×Make-up = {T80/1000:.1f} k lbf-ft — Surface torque = {surf_torque/1000:.2f} k → "
             f"{'PASS ✅' if passed_80 else 'FAIL ❌'} (margin {torque_margin/1000:.2f} k)")
-    st.caption("Rotation, friction and survey spacing matter for buckling assessment (AADE-19-NTCE-080).")
+    st.caption("Rotation, friction and survey spacing matter for buckling & severity (AADE-19-NTCE-080).")
 
     # Neutral point (on-bottom)
     df_on, T_on, _ = soft_string_stepper(
@@ -569,7 +563,6 @@ with tab:
         rpipe_ft = 0.5*dp_od*IN2FT
         clearance_ft = max(1e-4, rbore_ft - rpipe_ft)
 
-        # Proper Fc with rotation factor
         rot_factor = rot_fc_factor if "rotate" in scenario else 1.00
         lam_hel_ui = 2.83
         EI_dp_lbf_ft2 = EI_lbf_ft2_from_in4(Epsi, Iin4_dp)
@@ -583,29 +576,19 @@ with tab:
             rot_factor=rot_factor
         )
 
-        # segment stresses (simple, component taken as DP for severity visuals)
-        # bending stress σ_b = M/Z (use local torque as proxy for bending magnitude)
+        # stresses & BSI-like severity
         M_lbf_in = np.abs(df_itr['M_next_lbf_ft'].to_numpy()) * 12.0
         sigma_b_psi = np.where(Zin3_dp>0, M_lbf_in / max(Zin3_dp,1e-9), 0.0)
-
-        # torsional shear τ = T*r / J  (use OD/2 for r)
         r_in = dp_od/2.0
         tau_tor_psi = (np.abs(df_itr['M_next_lbf_ft'].to_numpy())*12.0 * r_in) / max(Jin4_dp,1e-9)
-
-        # axial stress σ_ax = T / A  (tension positive; compression negative)
         sigma_ax_psi = df_itr['T_next_lbf'].to_numpy() / max(Ain2_dp,1e-9)
-
-        # von Mises (approx) √(σ_ax^2 + 3 τ^2)
         sigma_vm_psi = np.sqrt(sigma_ax_psi**2 + 3.0*tau_tor_psi**2)
 
-        # BSI-like composite (Menand concept: stress + side-force drive severity) – scaled to 1..4
-        # Transparent scaling knobs:
-        SB = sigma_b_psi / 30000.0     # ~30 ksi pivot
-        SV = sigma_vm_psi / 60000.0    # ~60 ksi pivot
-        SN = np.abs(df_itr['N_lbf'].to_numpy()) / 5000.0  # ~5 klbf pivot
+        SB = sigma_b_psi / 30000.0
+        SV = sigma_vm_psi / 60000.0
+        SN = np.abs(df_itr['N_lbf'].to_numpy()) / 5000.0
         BSI = 1.0 + 3.0*np.clip(0.35*SB + 0.45*SV + 0.20*SN, 0.0, 1.0)
 
-        # Plots: hookload/limits + Fc and severity metrics
         fig_env = go.Figure()
         F_env = np.linspace(0, TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension, 100)
         T_env = (TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint)*np.sqrt(np.clip(1.0 - (F_env/np.maximum(F_env.max(),1.0))**2, 0.0, 1.0))
@@ -627,15 +610,12 @@ with tab:
         fig_hl.update_xaxes(title_text="Force / Hookload (k lbf)")
         fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
 
-        # NEW: severity panel (Side-force, Bending, von-Mises, BSI)
         fig_sv = go.Figure()
         fig_sv.add_trace(go.Scatter(x=df_itr['N_lbf'].to_numpy()/1000.0, y=depth, name="Side force (klbf)", mode="lines"))
         fig_sv.add_trace(go.Scatter(x=sigma_b_psi/1000.0, y=depth, name="Bending stress (ksi)", mode="lines"))
         fig_sv.add_trace(go.Scatter(x=sigma_vm_psi/1000.0, y=depth, name="von Mises (ksi)", mode="lines"))
-        # color-coded BSI curve
-        colors = np.where(BSI>=3.5, "red", np.where(BSI>=2.5,"orange", np.where(BSI>=1.5,"yellow","green")))
-        fig_sv.add_trace(go.Scatter(x=BSI, y=depth, mode="lines", name="BSI-like (1–4)",
-                                    line=dict(width=4, color="#444")))
+        fig_sv.add_trace(go.Scatter(x=BSI, y=depth, mode="lines",
+                                    name="BSI-like (1–4)", line=dict(width=4)))
         fig_sv.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_sv.update_xaxes(title_text="Severity metrics")
         fig_sv.update_layout(height=680, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
@@ -650,4 +630,46 @@ with tab:
     cal1, cal2, cal3, cal4 = st.columns(4)
     fit_depth = cal1.number_input("Depth to fit (MD ft)", 0.0, float(md[-1]), float(min(4000.0, md[-1])), 50.0)
     meas_pick = cal2.number_input("Measured Pickup HL (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
-    meas_slack= cal3.number_input("Measured Slack-off HL (lbf)", 0.0, 1_000_000.0, 
+    meas_slack= cal3.number_input("Measured Slack-off HL (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
+    meas_rot  = cal4.number_input("Measured Rotating off-bottom HL (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
+    meas_torque = st.number_input("Measured surface torque (lbf-ft, optional)", 0.0, 200_000.0, 0.0, 100.0)
+
+    with st.expander("Calibration search ranges (μ)"):
+        cA, cB, cC, cD = st.columns(4)
+        mu_c_s_rng = cA.text_input("μ_casing_slide: start,stop,step", "0.15,0.35,0.05")
+        mu_o_s_rng = cB.text_input("μ_open_slide: start,stop,step", "0.25,0.45,0.05")
+        mu_c_r_rng = cC.text_input("μ_casing_rot: start,stop,step", "0.15,0.35,0.05")
+        mu_o_r_rng = cD.text_input("μ_open_rot: start,stop,step", "0.20,0.40,0.05")
+
+    if st.button("Run μ calibration (grid search)"):
+        try:
+            parse = lambda s: tuple(float(x.strip()) for x in s.split(","))
+            mu_ranges = {
+                "mu_c_s": parse(mu_c_s_rng), "mu_o_s": parse(mu_o_s_rng),
+                "mu_c_r": parse(mu_c_r_rng), "mu_o_r": parse(mu_o_r_rng),
+            }
+            best = grid_calibrate_mu(
+                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props, mw_ppg,
+                depth_for_fit=fit_depth,
+                measured_pickup_hl=meas_pick if meas_pick>0 else None,
+                measured_slackoff_hl=meas_slack if meas_slack>0 else None,
+                measured_rotate_hl=meas_rot if meas_rot>0 else None,
+                measured_surface_torque=meas_torque if meas_torque>0 else None,
+                mu_ranges=mu_ranges
+            )
+            if best is None:
+                st.warning("Provide at least one measurement (pickup/slackoff/rotate).")
+            else:
+                st.session_state["μ_fit"] = best
+                st.success(f"Fitted μ: casing(slide)={best['mu_c_s']:.2f}, open(slide)={best['mu_o_s']:.2f}, "
+                           f"casing(rot)={best['mu_c_r']:.2f}, open(rot)={best['mu_o_r']:.2f} (SSE={best['SSE']:.1f})")
+                st.caption("Use overlay above to compare baseline vs calibrated.")
+        except Exception as e:
+            st.error(f"Calibration failed: {e}")
+
+    st.markdown("### Iteration trace (first 12 rows)")
+    st.dataframe(df_itr.head(12), use_container_width=True)
+
+    st.caption("Johancsik soft-string (Δs=1 ft) with Menand-inspired buckling & severity. "
+               "Defaults: last casing 9-5/8, OH 8.50 in. Tools: μ history match, calibrated overlay, NP, 0.8×MU gate, "
+               "BSR/SR, tortuosity penalty, motor bit torque, rig-limit margins, Fc with rotation & over-gage, and severity plots.")

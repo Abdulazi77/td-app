@@ -211,7 +211,7 @@ def grid_calibrate_mu(
     measured_rotate_hl: Optional[float], measured_surface_torque: Optional[float],
     mu_ranges: Dict[str, Tuple[float,float,float]],
 ):
-    """Very simple grid search across μ ranges; returns best μ dict or None.""""
+    """Very simple grid search across μ ranges; returns best μ dict or None."""
     targets = []
     if measured_pickup_hl is not None:   targets.append("pickup")
     if measured_slackoff_hl is not None: targets.append("slackoff")

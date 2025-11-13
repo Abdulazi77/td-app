@@ -113,7 +113,7 @@ def soft_string_stepper(
     mu_open_boost: float = 0.0,      # hole cleaning booster
 ):
     
-   """
+    """
     Δs = 1 ft soft-string integration, bit -> surface.
     scenario: "pickup" | "slackoff" | "rotate_off" | "onbottom"
     tortuosity_mode: inflate kappa or mu by (1+tau) in OPEN-HOLE segments.

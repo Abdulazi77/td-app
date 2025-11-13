@@ -338,12 +338,12 @@ with tab:
     # ───────── T&D Inputs
     st.subheader("Soft-string Torque & Drag — Johancsik (linked to survey above)")
     with st.expander("Typical μ starting ranges (lecture hints)"):
-        st.markdown(\"\"\"
+        st.markdown("""
 - **Casing (WBM):** 0.15 – 0.25 (sliding/rotating similar)  
 - **Open-hole (WBM):** 0.25 – 0.40 (can be higher when cleaning is poor)  
 - **OBM/SBM:** often lower than WBM  
 > Use **history matching** to calibrate for your well/section.
-\"\"\")
+""")
 
     mu_cased_slide = st.number_input("μ in casing (sliding)", 0.05, 0.80, 0.25, 0.01)
     mu_open_slide  = st.number_input("μ in open-hole (sliding)", 0.05, 0.80, 0.35, 0.01)

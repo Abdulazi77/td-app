@@ -117,11 +117,11 @@ def soft_string_stepper(
     tau: float = 0.0,                # 0.0 .. 0.5 typ
     mu_open_boost: float = 0.0,      # hole cleaning booster
 ):
-    \"\"\"
+    
     Δs = 1 ft soft-string integration, bit -> surface.
     scenario: "pickup" | "slackoff" | "rotate_off" | "onbottom"
     tortuosity_mode: inflate kappa or mu by (1+tau) in OPEN-HOLE segments.
-    \"\"\"
+    
     ds = 1.0
     md = np.asarray(md); inc_deg = np.asarray(inc_deg)
     nseg = len(md) - 1

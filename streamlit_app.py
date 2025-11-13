@@ -2,7 +2,7 @@
 # (z_NP = BF * L with BF = 1 - MW/65.5) without changing other behavior.
 # The file will be saved as `/mnt/data/streamlit_app_with_NP_simple.txt` for you to download.
 
-code = r'''from __future__ import annotations
+r'''from __future__ import annotations
 import math
 from typing import Dict, Iterable, Tuple, List, Optional
 

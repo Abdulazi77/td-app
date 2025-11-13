@@ -412,7 +412,7 @@ with tab:
     deltaP = st.number_input("Motor ΔP (psi)", 0.0, 5000.0, 0.0, 10.0) if motor_mode else 0.0
     Mbit = K_tbit * deltaP if motor_mode and scenario == "onbottom" else 0.0
 
-    # main run
+    # main run for selected scenario
     df_itr, T_arr, M_arr = soft_string_stepper(
         md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
         mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
@@ -422,7 +422,7 @@ with tab:
 
     depth = df_itr["md_bot_ft"].to_numpy()
 
-    # FIX: hookload is magnitude of axial force at surface
+    # hookload / torque at surface (magnitude)
     surf_hookload = abs(T_arr[-1])
     surf_torque  = abs(M_arr[-1])
     st.success(f"Surface hookload: {surf_hookload:,.0f} lbf — Surface torque: {surf_torque:,.0f} lbf-ft")
@@ -552,12 +552,18 @@ with tab:
             )
             return df_tmp["md_bot_ft"].to_numpy(), np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
 
-        # NEW: pickup drag sensitivity
-        def run_drag_pickup(mu_slide: float):
+        # NEW: drag μ-sweep helper — uses CURRENT scenario selection
+        def run_drag_mu_sweep(mu_val: float):
+            """
+            Compute tension profile vs depth for the current scenario but
+            with a uniform friction factor 'mu_val' applied to all segments.
+            This mirrors the torque μ-sweep but for drag.
+            """
             df_tmp, T_tmp, _ = soft_string_stepper(
                 md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-                mu_slide, mu_slide, mu_slide, mu_slide, mw_ppg,
-                scenario="pickup",
+                mu_val, mu_val, mu_val, mu_val, mw_ppg,
+                scenario=scenario,
+                WOB_lbf=wob, Mbit_ftlbf=Mbit,
                 tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
             )
             depth_tmp = df_tmp["md_bot_ft"].to_numpy()
@@ -768,12 +774,12 @@ with tab:
         with c3: st.plotly_chart(fig_env, use_container_width=True)
         with c4: st.plotly_chart(fig_hl,  use_container_width=True)
 
-        # ───────── NEW: Drag μ-sensitivity (tension vs depth) ─────────
-        st.markdown("### Drag μ-sensitivity — Drillstring tension vs depth")
+        # ───────── NEW: Drag μ-sensitivity (scenario-aware) ─────────
+        st.markdown("### Drag μ-sensitivity — Drillstring tension vs depth (for selected Scenario)")
 
         fig_drag = go.Figure()
         for mu in mu_band:
-            dmu, Tmu = run_drag_pickup(mu)
+            dmu, Tmu = run_drag_mu_sweep(mu)
             fig_drag.add_trace(
                 go.Scatter(
                     x=Tmu/1000.0,
@@ -782,10 +788,11 @@ with tab:
                     name=f"μ={mu:.2f}",
                     line=dict(color=mu_colors.get(mu, None)),
                     text=np.full_like(dmu, mu, dtype=float),
-                    hovertemplate="Tension: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<br>μ=%{text:.2f}<extra></extra>"
+                    hovertemplate="|T|: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<br>μ=%{text:.2f}<extra></extra>"
                 )
             )
 
+        # overlay critical buckling curves for context
         fig_drag.add_trace(go.Scatter(
             x=Fs/1000.0, y=depth,
             mode="lines", name="Fs (sinusoidal)", line=dict(dash="dash")
@@ -809,7 +816,7 @@ with tab:
             dtick=1000
         )
         fig_drag.update_xaxes(
-            title_text="Axial tension (k-lbf)",
+            title_text="Axial tension |T| (k-lbf)",
             showgrid=True
         )
         fig_drag.update_layout(
@@ -831,7 +838,7 @@ with tab:
         depth_slack = df_slack["md_bot_ft"].to_numpy()
         T_slack_ax = df_slack["T_next_lbf"].to_numpy()
 
-        # For this stepper, slackoff gives T < 0 in tension, T > 0 in compression
+        # slackoff: positive compression, negative tension
         F_comp = np.maximum(0.0, T_slack_ax)          # compression magnitude
         hookload_profile = np.abs(T_slack_ax)         # tension magnitude
 

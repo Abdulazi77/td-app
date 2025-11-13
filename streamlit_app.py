@@ -5,11 +5,7 @@ PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
 Single-tab linked workflow with calibration, NP, 0.8×MU, BSR/SR, tortuosity, motor-BT,
 rig-limit margins, hole-cleaning booster, and calibrated μ overlay (dashed).
 
-Added: four additional plots for buckling‐analysis:
-  • Tension/compression vs critical buckling (Fs/Fh)
-  • BSI vs depth (risk colour)
-  • Hookload & BSI vs depth
-  • 3D trajectory coloured by BSI
+Libraries needed: streamlit, plotly, numpy, pandas
 """
 
 from __future__ import annotations
@@ -22,7 +18,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ───────────────────────────── Page ─────────────────────────────
-st.set_page_config(page_title="Wellpath + T&D + Buckling Analysis", layout="wide")
+st.set_page_config(page_title="Wellpath + Torque & Drag (Δs = 1 ft)", layout="wide")
 
 # ─────────────────────────── Constants ──────────────────────────
 DEG2RAD = math.pi / 180.0
@@ -127,6 +123,7 @@ def soft_string_stepper(
     """
     Δs = 1 ft soft-string integration, bit -> surface.
     scenario: "pickup" | "slackoff" | "rotate_off" | "onbottom"
+    tortuosity_mode: inflate kappa or mu by (1+tau) in OPEN-HOLE segments.
     """
     ds = 1.0
     md = np.asarray(md); inc_deg = np.asarray(inc_deg)
@@ -164,7 +161,7 @@ def soft_string_stepper(
             elif tortuosity_mode == "mu":
                 mu_s[i] *= (1.0 + tau); mu_r[i] *= (1.0 + tau)
 
-    T = np.zeros(nseg+1); M = np.zeros(nseg+1)   # axial tension/compression, torque
+    T = np.zeros(nseg+1); M = np.zeros(nseg+1)   # axial tension, torque
     dT = np.zeros(nseg);  dM = np.zeros(nseg);   N_side = np.zeros(nseg)
 
     # boundary condition
@@ -259,7 +256,7 @@ def grid_calibrate_mu(
     return best
 
 # ─────────────────────────────── UI ──────────────────────────────
-(tab,) = st.tabs(["Wellpath + Torque & Drag + Buckling"])
+(tab,) = st.tabs(["Wellpath + Torque & Drag (linked)"])
 
 with tab:
     st.header("Wellpath + Torque & Drag (Δs = 1 ft) — Linked")
@@ -293,7 +290,7 @@ with tab:
     st.subheader("Casing / Open-hole (simple, last string + open hole)")
     md_end = float(md[-1])
     cc1, cc2, cc3, cc4, cc5 = st.columns(5)
-    nominal = cc1.selectbox("Last casing nominal OD", list(CASING_DB.keys()), index=1)
+    nominal = cc1.selectbox("Last casing nominal OD", list(CASING_DB.keys()), index=1)  # default 9-5/8
     weight  = cc2.selectbox("lb/ft (standards only)", list(CASING_DB[nominal]["weights"].keys()))
     casing_id_in = float(CASING_DB[nominal]["weights"][weight])
     cc3.text_input("Casing ID (in, locked)", f"{casing_id_in:.3f}", disabled=True)
@@ -309,20 +306,20 @@ with tab:
 
     # ───────── 3D split by shoe
     idx = int(np.searchsorted(md, shoe_md, side='right'))
-    fig3d_basic = go.Figure()
+    fig3d = go.Figure()
     if idx > 1:
-        fig3d_basic.add_trace(go.Scatter3d(x=E[:idx], y=N[:idx], z=TVD[:idx],
+        fig3d.add_trace(go.Scatter3d(x=E[:idx], y=N[:idx], z=TVD[:idx],
                                      mode="lines", line=dict(width=6, color="#4cc9f0"), name="Cased"))
     if idx < len(md):
-        fig3d_basic.add_trace(go.Scatter3d(x=E[idx-1:], y=N[idx-1:], z=TVD[idx-1:],
+        fig3d.add_trace(go.Scatter3d(x=E[idx-1:], y=N[idx-1:], z=TVD[idx-1:],
                                      mode="lines", line=dict(width=4, color="#a97142"), name="Open-hole"))
-    fig3d_basic.update_layout(height=420, scene=dict(
+    fig3d.update_layout(height=420, scene=dict(
         xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
         zaxis=dict(autorange="reversed")
     ), legend=dict(orientation="h"), margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig3d_basic, use_container_width=True)
+    st.plotly_chart(fig3d, use_container_width=True)
 
-    # 2D TVD‐VS
+    # 2D TVD-VS
     st.subheader("2D Wellbore Profile — TVD vs Vertical Section")
     vs_ref = st.number_input("VS reference azimuth (deg)", 0.0, 360.0, float(az[0] if len(az) else az_deg), 1.0)
     VS = N*np.cos(vs_ref*DEG2RAD) + E*np.sin(vs_ref*DEG2RAD)
@@ -340,152 +337,82 @@ with tab:
         "VS (ft)": VS[:11], "DLS (deg/100 ft)": DLS[:11]
     }), use_container_width=True)
 
-    # ───────── T&D Inputs (unchanged) …
-    # ... (Your existing UI code continues from here exactly as before) …
-    # [Keep everything up to before your existing “Envelope & Hookload diagnostics” section]
+    # ───────── T&D Inputs
+    st.subheader("Soft-string Torque & Drag — Johancsik (linked to survey above)")
+    with st.expander("Typical μ starting ranges (lecture hints)"):
+        st.markdown("""
+- **Casing (WBM):** 0.15 – 0.25 (sliding/rotating similar)  
+- **Open-hole (WBM):** 0.25 – 0.40 (can be higher when cleaning is poor)  
+- **OBM/SBM:** often lower than WBM  
+> Use **history matching** to calibrate for your well/section.
+""")
 
-    # ... existing UI inputs & run …
-    # After existing plots, add the new buckling plots:
+    mu_cased_slide = st.number_input("μ in casing (sliding)", 0.05, 0.80, 0.25, 0.01)
+    mu_open_slide  = st.number_input("μ in open-hole (sliding)", 0.05, 0.80, 0.35, 0.01)
+    mu_cased_rot   = st.number_input("μ in casing (rotating)", 0.05, 0.80, 0.25, 0.01)
+    mu_open_rot    = st.number_input("μ in open-hole (rotating)", 0.05, 0.80, 0.35, 0.01)
+    mw_ppg         = st.number_input("Mud weight (ppg)", 7.0, 20.0, 10.0, 0.1)
 
-    # -------------------- NEW BUCKLING ANALYSIS SECTION --------------------
-    st.subheader("Advanced Buckling Analysis")
+    hc1, hc2 = st.columns(2)
+    cleaning_mode = hc1.selectbox("Hole-cleaning condition (open-hole μ booster)", ["Good (0)", "Fair (+0.03)", "Poor (+0.08)"], index=0)
+    mu_boost = {"Good (0)":0.0, "Fair (+0.03)":0.03, "Poor (+0.08)":0.08}[cleaning_mode]
+    tort_mode = hc2.selectbox("Tortuosity penalty mode", ["off", "kappa", "mu"], index=0)
+    tau = st.slider("Penalty factor τ (for open-hole only)", 0.0, 0.5, 0.2, 0.05) if tort_mode != "off" else 0.0
 
-    # reuse variables: df_itr, depth etc from earlier
-    depth = df_itr["md_bot_ft"].to_numpy()
+    st.markdown("**Drillstring (bit up)**")
+    d1, d2, d3 = st.columns(3)
+    dc_len  = d1.number_input("DC length (ft)", 0.0, 10000.0, 600.0, 10.0)
+    hwdp_len= d2.number_input("HWDP length (ft)", 0.0, 20000.0, 1000.0, 10.0)
+    dp_len  = d3.number_input("DP length (ft)", 0.0, 50000.0, max(0.0, float(md[-1])-(dc_len+hwdp_len)), 10.0)
 
-    # section local geometry
+    e1, e2, e3 = st.columns(3)
+    dc_od = e1.number_input("DC OD (in)", 3.0, 12.0, 8.0, 0.1)
+    hwdp_od = e2.number_input("HWDP OD (in)", 2.0, 8.0, 3.5, 0.1)
+    dp_od = e3.number_input("DP OD (in)", 3.0, 6.625, 5.0, 0.01)
+
+    i1, i2, i3 = st.columns(3)
+    dc_id = i1.number_input("DC ID (in)", 0.5, 6.0, 2.81, 0.01)
+    hwdp_id = i2.number_input("HWDP ID (in)", 0.5, 4.0, 2.0, 0.01)
+    dp_id = i3.number_input("DP ID (in)", 1.5, 5.0, 4.28, 0.01)
+
+    w1, w2, w3 = st.columns(3)
+    dc_w   = w1.number_input("DC weight (air, lb/ft)",   30.0, 150.0, 66.7, 0.1)
+    hwdp_w = w2.number_input("HWDP weight (air, lb/ft)",  5.0,  40.0, 16.0, 0.1)
+    dp_w   = w3.number_input("DP weight (air, lb/ft)",    8.0,  40.0, 19.5, 0.1)
+
+    # map string along depth
+    nseg = len(md) - 1
+    comp_along = np.empty(nseg, dtype=object)
+    for i in range(nseg):
+        from_bit = float(md[-1]) - md[i]
+        if from_bit <= dc_len: comp_along[i] = "DC"
+        elif from_bit <= dc_len + hwdp_len: comp_along[i] = "HWDP"
+        else: comp_along[i] = "DP"
+
+    comp_props = {
+        "DC":   {"od_in": dc_od,   "id_in": dc_id,   "w_air_lbft": dc_w},
+        "HWDP": {"od_in": hwdp_od, "id_in": hwdp_id, "w_air_lbft": hwdp_w},
+        "DP":   {"od_in": dp_od,   "id_in": dp_id,   "w_air_lbft": dp_w},
+    }
+
+    # NEW: per-segment geometry arrays for severity calcs
+    comp_map = {"DC": (dc_od, dc_id), "HWDP": (hwdp_od, hwdp_id), "DP": (dp_od, dp_id)}
     comp_od_in = np.array([comp_map[c][0] for c in comp_along])
     comp_id_in = np.array([comp_map[c][1] for c in comp_along])
-    od_local = comp_od_in
-    id_local = comp_id_in
-    I_local  = np.array([I_in4(o, i) for o, i in zip(od_local, id_local)])
-    Z_local  = np.array([Z_in3(o, i) for o, i in zip(od_local, id_local)])
-    A_local  = np.array([A_in2(o, i) for o, i in zip(od_local, id_local)])
-    J_local  = np.array([J_in4(o, i) for o, i in zip(od_local, id_local)])
 
-    hole_d_profile = np.where(df_itr["cased?"].to_numpy(), 2.0*casing_id_in, hole_diam_in)
-    r_ft_local = np.maximum(1e-4, 0.5*(hole_d_profile - od_local) * IN2FT)
+    # curvature per-ft
+    _, _, _, DLS = mincurv_positions(md, inc_deg, az)
+    kappa = (DLS*DEG2RAD)/100.0
 
-    # critical loads Fs, Fh
-    Epsi = 30.0e6
-    EI_factor = EI_lbf_ft2_from_in4(Epsi, 1.0)
-    EI_ft2_local = EI_factor * I_local
-    theta_rad = np.deg2rad(np.maximum(0.0, df_itr['inc_deg'].to_numpy()))
-    denom = np.maximum(r_ft_local*np.sin(theta_rad), 1e-9)
-    Fs = (2.0 * EI_ft2_local * df_itr['w_b_lbft'].to_numpy()) / denom
-    Fh = (2.83 * EI_ft2_local * df_itr['w_b_lbft'].to_numpy()) / denom
+    # scenario + bit torque
+    scen = st.selectbox("Scenario", ["Slack-off (RIH)","Pickup (POOH)","Rotate off-bottom","Rotate on-bottom"])
+    scenario = {"Slack-off (RIH)":"slackoff","Pickup (POOH)":"pickup","Rotate off-bottom":"rotate_off","Rotate on-bottom":"onbottom"}[scen]
+    wob  = st.number_input("WOB (lbf) for on-bottom", 0.0, 150000.0, 6000.0, 100.0)
+    mcol1, mcol2 = st.columns(2)
+    motor_mode = mcol1.checkbox("Motor on-bottom (bit torque from ΔP)", value=False)
+    K_tbit = mcol2.number_input("Motor torque factor K (lbf-ft/psi)", 0.0, 10_000.0, 2.5, 0.1) if motor_mode else 0.0
+    deltaP = st.number_input("Motor ΔP (psi)", 0.0, 5000.0, 0.0, 10.0) if motor_mode else 0.0
+    Mbit = K_tbit * deltaP if motor_mode and scenario == "onbottom" else 0.0
 
-    # Side‐force & bending/unified stresses
-    M_b_lbf_in  = df_itr["N_lbf"].to_numpy() * r_ft_local * 12.0
-    sigma_b_psi = np.divide(M_b_lbf_in, np.maximum(Z_local, 1e-9))
-    r_in        = od_local/2.0
-    T_lbf_in    = np.abs(df_itr["M_next_lbf_ft"].to_numpy()) * 12.0
-    tau_psi     = np.divide(T_lbf_in * r_in, np.maximum(J_local, 1e-9))
-    sigma_ax_psi= np.divide(df_itr["T_next_lbf"].to_numpy(), np.maximum(A_local, 1e-9))
-    sigma_ax_wf = sigma_ax_psi + np.sign(sigma_ax_psi)*np.abs(sigma_b_psi)
-    sigma_vm_psi= np.sqrt(sigma_ax_wf**2 + 3.0*tau_psi**2)
-    SB = sigma_b_psi / 30000.0
-    SV = sigma_vm_psi  / 60000.0
-    SN = np.abs(df_itr["N_lbf"].to_numpy()) / 5000.0
-    BSI = 1.0 + 3.0*np.clip(0.35*SB + 0.45*SV + 0.20*SN, 0.0, 1.0)  # ranges ~1-4
-
-    # 1. Tension/compression vs critical buckling loads
-    # sliding (compression) scenario
-    df_slack, T_slack, _ = soft_string_stepper(
-        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-        mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
-        mw_ppg, scenario="slackoff", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
-    )
-    F_comp = np.maximum(0.0, -df_slack["T_next_lbf"].to_numpy())
-
-    fig_tension = go.Figure()
-    fig_tension.add_trace(go.Scatter(
-        x=F_comp/1000.0, y=depth, mode="lines", name="Compression load",
-        hovertemplate="F_comp: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"
-    ))
-    # For tension (pickup)
-    df_pick, _, _ = soft_string_stepper(
-        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-        mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
-        mw_ppg, scenario="pickup", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
-    )
-    F_tens = df_pick["T_next_lbf"].to_numpy()
-    fig_tension.add_trace(go.Scatter(
-        x=F_tens/1000.0, y=depth, mode="lines", name="Tensile load",
-        hovertemplate="Tensile: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"
-    ))
-    fig_tension.add_trace(go.Scatter(
-        x=Fs/1000.0, y=depth, mode="lines", name="Fs (sinusoidal)", line=dict(dash="dash")
-    ))
-    fig_tension.add_trace(go.Scatter(
-        x=Fh/1000.0, y=depth, mode="lines", name="Fh (helical)", line=dict(dash="dot")
-    ))
-    fig_tension.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-    fig_tension.update_xaxes(title_text="Axial Force (k lbf)")
-    fig_tension.update_layout(title="Tension / Compression vs Buckling Loads (Fs/Fh)", height=500, margin=dict(l=10,r=10,t=40,b=10))
-    st.plotly_chart(fig_tension, use_container_width=True)
-
-    # 2. BSI vs depth with risk colouring
-    fig_bsi = go.Figure()
-    fig_bsi.add_trace(go.Scatter(
-        x=BSI, y=depth, mode="lines",
-        line=dict(color="red", width=3),
-        name="BSI",
-        hovertemplate="BSI: %{x:.2f}<br>MD: %{y:.0f} ft<extra></extra>"
-    ))
-    # colour-bands
-    fig_bsi.add_shape(type="rect", x0=1, x1=2, y0=depth.min(), y1=depth.max(),
-                      fillcolor="rgba(0,255,0,0.1)", line_width=0, layer="below")
-    fig_bsi.add_shape(type="rect", x0=2, x1=3, y0=depth.min(), y1=depth.max(),
-                      fillcolor="rgba(255,255,0,0.1)", line_width=0, layer="below")
-    fig_bsi.add_shape(type="rect", x0=3, x1=4.2, y0=depth.min(), y1=depth.max(),
-                      fillcolor="rgba(255,0,0,0.1)", line_width=0, layer="below")
-    fig_bsi.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-    fig_bsi.update_xaxes(title_text="BSI (1=low risk → 4=severe)", range=[1,4.2])
-    fig_bsi.update_layout(title="Buckling Severity Index (BSI) vs Depth", height=500, margin=dict(l=10,r=10,t=40,b=10))
-    st.plotly_chart(fig_bsi, use_container_width=True)
-
-    # 3. Hookload & BSI vs depth
-    fig_hl_bsi = go.Figure()
-    HL_arr = np.maximum(0.0, -df_slack["T_next_lbf"].to_numpy())/1000.0  # in k lbf
-    fig_hl_bsi.add_trace(go.Scatter(
-        x=HL_arr, y=depth, mode="lines", name="Hookload (k lbf)",
-        line=dict(color="#1f77b4", width=2),
-        hovertemplate="HL: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"
-    ))
-    fig_hl_bsi.add_trace(go.Scatter(
-        x=BSI, y=depth, mode="lines", name="BSI",
-        line=dict(color="red", width=2, dash="dot"),
-        xaxis="x2",
-        hovertemplate="BSI: %{x:.2f}<br>MD: %{y:.0f} ft<extra></extra>"
-    ))
-    fig_hl_bsi.update_layout(
-        title="Hookload & Buckling Severity Index vs Depth",
-        height=500,
-        margin=dict(l=10,r=10,t=40,b=10),
-        xaxis=dict(domain=[0.0, 0.65], title="Hookload (k lbf)"),
-        xaxis2=dict(domain=[0.70,1.0], overlaying="x", side="top", title="BSI (1-4)", range=[1.0,4.2]),
-    )
-    fig_hl_bsi.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-    st.plotly_chart(fig_hl_bsi, use_container_width=True)
-
-    # 4. 3D trajectory colour-mapped by BSI
-    # we map BSI values along the trajectory: we assume one BSI per segment (df_itr rows)
-    # assign a colour scale to BSI: 1->blue,4->red
-    BSI_norm = (BSI - 1.0)/3.0  # normalised 0-1
-    colours = [f"rgb({int(255*bs)},{0},{int(255*(1-bs))})" for bs in BSI_norm]  # red to blue
-    fig3d = go.Figure()
-    fig3d.add_trace(go.Scatter3d(
-        x=E, y=N, z=TVD,
-        mode="lines",
-        line=dict(width=5, color=colours, colorscale='Jet', showscale=True, colorbar=dict(title="BSI")),
-        hovertemplate="BSI approx: %{customdata:.2f}<br>TVD: %{z:.0f} ft<extra></extra>",
-        customdata=BSI
-    ))
-    fig3d.update_layout(height=550, scene=dict(
-        xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)",
-        zaxis=dict(autorange="reversed")
-    ), title="3D Well Trajectory Colour-Mapped by Buckling Severity Index (BSI)")
-    st.plotly_chart(fig3d, use_container_width=True)
-
-    # ───────── End of NEW BUCKLING plots section ─────────
+    # main run
+    df_itr, T_arr, M_arr = soft_string_stepper(

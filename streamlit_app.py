@@ -756,16 +756,57 @@ with tab:
         fig_env.update_yaxes(title_text="Tension (k lbf)")
         fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
 
+        # NEW: drag / tension μ-sweep vs depth (like commercial drag plots)
         fig_hl = go.Figure()
-        fig_hl.add_trace(go.Scatter(x=np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())/1000.0, y=depth,
-                                    mode="lines", name="Hookload"))
-        fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
-        fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))
-        fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh", line=dict(dash="dot")))
-        fig_hl.add_trace(go.Scatter(x=BSI, y=depth, name="BSI (1–4)", line=dict(width=4, color="red")))
+
+        def run_drag_pickup(mu_val: float):
+            df_tmp, T_tmp, _ = soft_string_stepper(
+                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+                mu_val, mu_val, mu_val, mu_val, mw_ppg,
+                scenario="pickup", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+            )
+            depth_tmp = df_tmp["md_bot_ft"].to_numpy()
+            tension_tmp = np.maximum(0.0, df_tmp["T_next_lbf"].to_numpy())
+            return depth_tmp, tension_tmp
+
+        for mu in mu_band:
+            dmu_drag, Fmu_drag = run_drag_pickup(mu)
+            fig_hl.add_trace(go.Scatter(
+                x=Fmu_drag/1000.0,
+                y=dmu_drag,
+                mode="lines",
+                name=f"Tension μ={mu:.2f}",
+                line=dict(color=mu_colors.get(mu, None)),
+                hovertemplate="Tension: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"
+            ))
+
+        # rig pull limit, buckling curves & BSI overlay
+        fig_hl.add_vline(
+            x=rig_pull_lim/1000.0,
+            line_color="magenta",
+            line_dash="dot",
+            annotation_text="Rig pull limit"
+        )
+        fig_hl.add_trace(go.Scatter(
+            x=Fs/1000.0, y=depth,
+            name="Sinusoidal Fs", line=dict(dash="dash")
+        ))
+        fig_hl.add_trace(go.Scatter(
+            x=Fh/1000.0, y=depth,
+            name="Helical Fh", line=dict(dash="dot")
+        ))
+        fig_hl.add_trace(go.Scatter(
+            x=BSI, y=depth,
+            name="BSI (1–4)", line=dict(width=4, color="red")
+        ))
         fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-        fig_hl.update_xaxes(title_text="Force / Hookload (k lbf) & BSI")
-        fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
+        fig_hl.update_xaxes(title_text="Tension / Hookload (k lbf) & BSI")
+        fig_hl.update_layout(
+            title="Drillstring tension vs depth — μ sensitivity & buckling",
+            height=420,
+            margin=dict(l=10,r=10,t=30,b=10),
+            legend=dict(orientation="h")
+        )
 
         c3, c4 = st.columns(2)
         with c3: st.plotly_chart(fig_env, use_container_width=True)

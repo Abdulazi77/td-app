@@ -23,15 +23,13 @@ st.set_page_config(page_title="Wellpath + Torque & Drag (Δs = 1 ft)", layout="w
 # ─────────────────────────── Constants ──────────────────────────
 DEG2RAD = math.pi / 180.0
 IN2FT   = 1.0/12.0
-LBF_TO_KN = 4.4482216152605 / 1000.0        # lbf → kN
-LBF_FT_TO_KNM = 1.3558179483314 / 1000.0    # lbf-ft → kN·m
 
 def clamp(x: float, lo: float, hi: float) -> float: return max(lo, min(hi, x))
 def bf_from_mw(mw_ppg: float) -> float: return (65.5 - mw_ppg)/65.5  # steel ~65.5 ppg
 def I_in4(od_in: float, id_in: float) -> float: return (math.pi/64.0)*(od_in**4 - id_in**4)
 def Z_in3(od_in: float, id_in: float) -> float: return I_in4(od_in, id_in) / (od_in/2.0)
 
-# extra section properties
+# NEW: extra section properties
 def A_in2(od_in: float, id_in: float) -> float: return (math.pi/4.0)*(od_in**2 - id_in**2)
 def J_in4(od_in: float, id_in: float) -> float: return (math.pi/32.0)*(od_in**4 - id_in**4)
 
@@ -163,23 +161,25 @@ def soft_string_stepper(
             elif tortuosity_mode == "mu":
                 mu_s[i] *= (1.0 + tau); mu_r[i] *= (1.0 + tau)
 
-    T = np.zeros(nseg+1); M = np.zeros(nseg+1)   # axial force, torque
+    T = np.zeros(nseg+1); M = np.zeros(nseg+1)   # axial tension, torque
     dT = np.zeros(nseg);  dM = np.zeros(nseg);   N_side = np.zeros(nseg)
 
     # boundary condition
     if scenario == "onbottom":
-        T[0] = -float(WOB_lbf)       # compressive at bit → negative
+        T[0] = -float(WOB_lbf)       # compressive at bit
         M[0] = float(Mbit_ftlbf)     # motor / bit torque allowed
 
     sgn_ax = {"pickup": +1.0, "slackoff": -1.0}.get(scenario, 0.0)
 
     for i in range(nseg):
+        # side-force cannot be negative
         N_raw = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
         N_side[i] = max(0.0, N_raw)
 
+        # axial
         T_next = T[i] + (sgn_ax*w_b[i]*math.cos(inc[i]) + mu_s[i]*N_side[i])*ds
+        # torque
         M_next = M[i] + (mu_r[i]*N_side[i]*r_eff_ft[i])*ds
-
         dT[i] = T_next - T[i]; dM[i] = M_next - M[i]
         T[i+1] = T_next; M[i+1] = M_next
 
@@ -243,7 +243,7 @@ def grid_calibrate_mu(
                             mu_c_s, mu_o_s, mu_c_r, mu_o_r, mw_ppg,
                             scenario=scen, WOB_lbf=0.0, Mbit_ftlbf=0.0
                         )
-                        HL = abs(T_tmp[-1])  # magnitude of surface tension
+                        HL = max(0.0, -T_tmp[-1])
                         if scen == "pickup":   err2 += (HL - measured_pickup_hl)**2
                         if scen == "slackoff": err2 += (HL - measured_slackoff_hl)**2
                         if scen == "rotate_off" and measured_rotate_hl is not None:
@@ -395,7 +395,7 @@ with tab:
         "DP":   {"od_in": dp_od,   "id_in": dp_id,   "w_air_lbft": dp_w},
     }
 
-    # per-segment geometry arrays for severity calcs
+    # NEW: per-segment geometry arrays for severity calcs
     comp_map = {"DC": (dc_od, dc_id), "HWDP": (hwdp_od, hwdp_id), "DP": (dp_od, dp_id)}
     comp_od_in = np.array([comp_map[c][0] for c in comp_along])
     comp_id_in = np.array([comp_map[c][1] for c in comp_along])
@@ -423,10 +423,7 @@ with tab:
     )
 
     depth = df_itr["md_bot_ft"].to_numpy()
-
-    # hookload magnitude and surface torque magnitude
-    surf_hookload = abs(T_arr[-1])
-    surf_torque  = abs(M_arr[-1])
+    surf_hookload = max(0.0, -T_arr[-1]); surf_torque = abs(M_arr[-1])
     st.success(f"Surface hookload: {surf_hookload:,.0f} lbf — Surface torque: {surf_torque:,.0f} lbf-ft")
 
     # ───────── Safety & limits
@@ -519,8 +516,8 @@ with tab:
     if simple_mode:
         figT = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["M_next_lbf_ft"]), mode="lines", name="Torque"))
         figT.update_xaxes(title_text="MD (ft)"); figT.update_yaxes(title_text="Torque (lbf-ft)")
-        figH = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["T_next_lbf"]), mode="lines", name="Hookload"))
-        figH.update_xaxes(title_text="MD (ft)"); figH.update_yaxes(title_text="Axial force |T| (lbf)")
+        figH = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.maximum(0.0, -df_itr["T_next_lbf"]), mode="lines", name="Hookload"))
+        figH.update_xaxes(title_text="MD (ft)"); figH.update_yaxes(title_text="Hookload (lbf)")
         c1x, c2x = st.columns(2)
         with c1x: st.plotly_chart(figT, use_container_width=True)
         with c2x: st.plotly_chart(figH, use_container_width=True)
@@ -532,6 +529,7 @@ with tab:
             default=[0.20,0.25,0.30,0.35]
         )
 
+        # ensure sorted μ and consistent color map
         mu_band = sorted(mu_band)
         mu_colors = {
             0.15: "#5bc0de",
@@ -554,21 +552,10 @@ with tab:
             )
             return df_tmp["md_bot_ft"].to_numpy(), np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
 
-        # NEW: pickup drag sensitivity (tension vs depth, not friction-only)
-        def run_drag_pickup(mu_slide: float):
-            df_tmp, T_tmp, _ = soft_string_stepper(
-                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
-                mu_slide, mu_slide, mu_slide, mu_slide, mw_ppg,
-                scenario="pickup",
-                tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
-            )
-            depth_tmp = df_tmp["md_bot_ft"].to_numpy()
-            T_mag = np.abs(df_tmp["T_next_lbf"].to_numpy())
-            return depth_tmp, T_mag
-
-        # LEFT: μ-sweep off-bottom torque vs depth
+        # LEFT: μ-sweep off-bottom torque vs depth (enhanced)
         fig_left = go.Figure()
 
+        # background bands: safe (0–0.8 MU), warning (0.8 MU–rig torque), danger (rig torque+)
         x_safe_max = T_makeup_sf/1000.0
         x_warn_max = rig_torque_lim/1000.0
 
@@ -600,6 +587,7 @@ with tab:
                 hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<br>μ=%{customdata:.2f}<extra></extra>"
             ))
 
+        # μ-calibrated overlay
         if overlay_calibrated and mu_fit is not None:
             dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
             fig_left.add_trace(
@@ -612,6 +600,7 @@ with tab:
                 )
             )
 
+        # limits
         fig_left.add_vline(
             x=T_makeup_sf/1000.0,
             line_color="#00d5ff",
@@ -627,6 +616,7 @@ with tab:
             annotation_position="top"
         )
 
+        # casing vs open hole marker at shoe
         fig_left.add_hline(
             y=shoe_md,
             line_dash="dot",
@@ -635,6 +625,7 @@ with tab:
             annotation_position="right"
         )
 
+        # measured torque overlay (if provided)
         if meas_md is not None and meas_tq_kft is not None:
             fig_left.add_trace(
                 go.Scatter(
@@ -651,6 +642,7 @@ with tab:
         fig_left.update_yaxes(
             autorange="reversed",
             title_text="Depth (ft)",
+            tick0=0,
             dtick=1000,
             showgrid=True
         )
@@ -670,8 +662,7 @@ with tab:
         fig_right = go.Figure()
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu, mu)
-            if tmu[0] < tmu[-1]:
-                tmu = tmu[::-1]
+            if tmu[0] < tmu[-1]: tmu = tmu[::-1]
             fig_right.add_trace(go.Scatter(
                 x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines",
                 line=dict(color=mu_colors.get(mu, None)),
@@ -694,8 +685,324 @@ with tab:
         fig_right.update_xaxes(title_text="Elemental torque (k lbf-ft)")
         fig_right.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
 
+        # overlay calibrated (elemental style off-bottom)
         if overlay_calibrated and mu_fit is not None:
             dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
-            if tcal[0] < tcal[-1]:
-                tcal = tcal[::-1]
-            fig_right.add_tr
+            if tcal[0] < tcal[-1]: tcal = tcal[::-1]
+            fig_right.add_trace(
+                go.Scatter(x=tcal/1000.0, y=dcal, mode="lines",
+                           name="μ (calibrated, elemental)", line=dict(dash="dash"))
+            )
+
+        cL, cR = st.columns(2)
+        with cL: st.plotly_chart(fig_left, use_container_width=True)
+        with cR: st.plotly_chart(fig_right, use_container_width=True)
+
+        # ───────── Envelope & Hookload diagnostics (PHYSICS-ENHANCED)
+        Epsi = 30.0e6
+
+        # per-segment local section properties
+        od_local = comp_od_in
+        id_local = comp_id_in
+        I_local  = np.array([I_in4(o, i) for o, i in zip(od_local, id_local)])
+        Z_local  = np.array([Z_in3(o, i) for o, i in zip(od_local, id_local)])
+        A_local  = np.array([A_in2(o, i) for o, i in zip(od_local, id_local)])
+        J_local  = np.array([J_in4(o, i) for o, i in zip(od_local, id_local)])
+
+        # clearance per segment: casing ID if cased, else open-hole diameter
+        hole_d_profile = np.where(df_itr["cased?"].to_numpy(), 2.0*casing_id_in, hole_diam_in)
+        r_ft_local = np.maximum(1e-4, 0.5*(hole_d_profile - od_local) * IN2FT)
+
+        # critical loads Fs, Fh (Menand-style)
+        EI_factor = EI_lbf_ft2_from_in4(Epsi, 1.0)
+        EI_ft2_local = EI_factor * I_local
+        theta_rad = np.deg2rad(np.maximum(0.0, df_itr['inc_deg'].to_numpy()))
+        denom = np.maximum(r_ft_local*np.sin(theta_rad), 1e-9)
+        Fs = (2.0 * EI_ft2_local * df_itr['w_b_lbft'].to_numpy()) / denom
+        Fh = (2.83 * EI_ft2_local * df_itr['w_b_lbft'].to_numpy()) / denom  # ~helical coeff
+
+        # bending from wall contact (moment arm = clearance)
+        M_b_lbf_in  = df_itr["N_lbf"].to_numpy() * r_ft_local * 12.0
+        sigma_b_psi = np.divide(M_b_lbf_in, np.maximum(Z_local, 1e-9))
+
+        # torsional shear from torque
+        r_in        = od_local/2.0
+        T_lbf_in    = np.abs(df_itr["M_next_lbf_ft"].to_numpy()) * 12.0
+        tau_psi     = np.divide(T_lbf_in * r_in, np.maximum(J_local, 1e-9))
+
+        # axial stress (+ tension, − compression)
+        sigma_ax_psi = np.divide(df_itr["T_next_lbf"].to_numpy(), np.maximum(A_local, 1e-9))
+
+        # worst-fiber axial
+        sigma_ax_wf  = sigma_ax_psi + np.sign(sigma_ax_psi)*np.abs(sigma_b_psi)
+
+        # von Mises
+        sigma_vm_psi = np.sqrt(sigma_ax_wf**2 + 3.0*tau_psi**2)
+
+        # BSI-like composite
+        SB = sigma_b_psi / 30000.0
+        SV = sigma_vm_psi / 60000.0
+        SN = np.abs(df_itr["N_lbf"].to_numpy()) / 5000.0
+        BSI = 1.0 + 3.0*np.clip(0.35*SB + 0.45*SV + 0.20*SN, 0.0, 1.0)
+
+        fig_env = go.Figure()
+        F_env = np.linspace(0, TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension, 100)
+        T_env = (TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint)*np.sqrt(np.clip(1.0 - (F_env/np.maximum(F_env.max(),1.0))**2, 0.0, 1.0))
+        fig_env.add_trace(go.Scatter(x=T_env/1000.0, y=F_env/1000.0, mode="lines", name="API 7G envelope (approx)"))
+        fig_env.add_vline(x=0.8*T_makeup/1000.0, line_color="#00d5ff", line_dash="dash", annotation_text="0.8×MU")
+        fig_env.add_trace(go.Scatter(x=[surf_torque/1000.0], y=[surf_hookload/1000.0], mode="markers",
+                                     name="Operating point", marker=dict(size=10, color="orange")))
+        fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
+        fig_env.update_yaxes(title_text="Tension (k lbf)")
+        fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
+
+        fig_hl = go.Figure()
+        fig_hl.add_trace(go.Scatter(x=np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())/1000.0, y=depth,
+                                    mode="lines", name="Hookload"))
+        fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
+        fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))
+        fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh", line=dict(dash="dot")))
+        fig_hl.add_trace(go.Scatter(x=BSI, y=depth, name="BSI (1–4)", line=dict(width=4, color="red")))
+        fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
+        fig_hl.update_xaxes(title_text="Force / Hookload (k lbf) & BSI")
+        fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
+
+        c3, c4 = st.columns(2)
+        with c3: st.plotly_chart(fig_env, use_container_width=True)
+        with c4: st.plotly_chart(fig_hl,  use_container_width=True)
+
+        # ───────── NEW ADVANCED BUCKLING & MODE PLOTS ─────────
+        st.markdown("### Advanced buckling views (compression, modes & 3D severity)")
+
+        # Sliding / RIH run for compression & hookload profiles
+        df_slack, T_slack, M_slack = soft_string_stepper(
+            md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+            mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot, mw_ppg,
+            scenario="slackoff", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+        )
+        depth_slack = df_slack["md_bot_ft"].to_numpy()
+
+        # Pickup (POOH) and rotating off-bottom runs for mode comparison
+        df_pick2, T_pick2, M_pick2 = soft_string_stepper(
+            md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+            mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot, mw_ppg,
+            scenario="pickup", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+        )
+        df_rot2, T_rot2, M_rot2 = soft_string_stepper(
+            md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+            mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot, mw_ppg,
+            scenario="rotate_off", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+        )
+
+        # Mode plots (Lowering / Rotating / Hoisting) — drag & torque vs depth
+        depth_drag = depth_slack
+
+        drag_lower = np.maximum(0.0, -df_slack["T_next_lbf"].to_numpy())/1000.0
+        drag_rot   = np.maximum(0.0, -df_rot2["T_next_lbf"].to_numpy())/1000.0
+        drag_hoist = np.maximum(0.0, -df_pick2["T_next_lbf"].to_numpy())/1000.0
+
+        torque_lower = np.abs(df_slack["M_next_lbf_ft"].to_numpy())/1000.0
+        torque_rot   = np.abs(df_rot2["M_next_lbf_ft"].to_numpy())/1000.0
+        torque_hoist = np.abs(df_pick2["M_next_lbf_ft"].to_numpy())/1000.0
+
+        fig_drag_modes = go.Figure()
+        fig_drag_modes.add_trace(go.Scatter(
+            x=drag_lower, y=depth_drag, mode="lines", name="Lowering (slack-off)"
+        ))
+        fig_drag_modes.add_trace(go.Scatter(
+            x=drag_rot, y=depth_drag, mode="lines", name="Rotating off-bottom"
+        ))
+        fig_drag_modes.add_trace(go.Scatter(
+            x=drag_hoist, y=depth_drag, mode="lines", name="Hoisting (pickup)"
+        ))
+        fig_drag_modes.update_yaxes(autorange="reversed", title_text="Depth (ft)", dtick=1000)
+        fig_drag_modes.update_xaxes(title_text="Hookload / drag (k lbf)")
+        fig_drag_modes.update_layout(
+            title="Drag / hookload vs depth — operating modes",
+            height=500,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h")
+        )
+
+        fig_torque_modes = go.Figure()
+        fig_torque_modes.add_trace(go.Scatter(
+            x=torque_lower, y=depth_drag, mode="lines", name="Lowering (slack-off)"
+        ))
+        fig_torque_modes.add_trace(go.Scatter(
+            x=torque_rot, y=depth_drag, mode="lines", name="Rotating off-bottom"
+        ))
+        fig_torque_modes.add_trace(go.Scatter(
+            x=torque_hoist, y=depth_drag, mode="lines", name="Hoisting (pickup)"
+        ))
+        fig_torque_modes.update_yaxes(autorange="reversed", title_text="Depth (ft)", dtick=1000)
+        fig_torque_modes.update_xaxes(title_text="Torque (k lbf-ft)")
+        fig_torque_modes.update_layout(
+            title="Torque vs depth — operating modes",
+            height=500,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h")
+        )
+
+        # (1) Compression vs critical buckling loads (Fs / Fh)
+        F_comp = np.maximum(0.0, -df_slack["T_next_lbf"].to_numpy())  # compression positive
+        fig_buck = go.Figure()
+        fig_buck.add_trace(go.Scatter(
+            x=F_comp/1000.0, y=depth_slack,
+            mode="lines", name="Compressive load (slackoff)",
+            hovertemplate="F: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"
+        ))
+        fig_buck.add_trace(go.Scatter(
+            x=Fs/1000.0, y=depth,
+            mode="lines", name="Fs (sinusoidal)", line=dict(dash="dash")
+        ))
+        fig_buck.add_trace(go.Scatter(
+            x=Fh/1000.0, y=depth,
+            mode="lines", name="Fh (helical)", line=dict(dash="dot")
+        ))
+        fig_buck.update_yaxes(autorange="reversed", title_text="Depth (ft)", dtick=1000)
+        fig_buck.update_xaxes(title_text="Compression / critical load (k lbf)")
+        fig_buck.update_layout(
+            title="Compression vs critical buckling loads — sliding / RIH",
+            height=500,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h")
+        )
+
+        # (2) Hookload & BSI vs depth (Fig.8-style plot)
+        BSI_clipped = np.clip(BSI, 1.0, 4.0)
+        hookload_profile = np.maximum(0.0, -df_slack["T_next_lbf"].to_numpy())/1000.0
+        fig_bsi = go.Figure()
+        fig_bsi.add_trace(go.Scatter(
+            x=BSI_clipped, y=depth,
+            mode="lines",
+            name="BSI",
+            line=dict(width=4),
+            hovertemplate="BSI: %{x:.2f}<br>MD: %{y:.0f} ft<extra></extra>"
+        ))
+        fig_bsi.add_trace(go.Scatter(
+            x=hookload_profile, y=depth_slack,
+            xaxis="x2",
+            mode="lines",
+            name="Hookload (sliding)",
+            line=dict(),
+            hovertemplate="HL: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"
+        ))
+        fig_bsi.update_layout(
+            title="Hookload & Buckling Severity Index while sliding",
+            height=500,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h"),
+            xaxis=dict(
+                domain=[0.0, 0.45],
+                title="Buckling Severity Index ν (1 = low, 4 = severe)",
+                range=[1.0, 4.1]
+            ),
+            xaxis2=dict(
+                domain=[0.55, 1.0],
+                overlaying="x",
+                side="top",
+                title="Hookload (k lbf)"
+            ),
+            yaxis=dict(autorange="reversed", title="Depth (ft)", dtick=1000),
+        )
+
+        # (3) 3D wellpath coloured by BSI (buckling severity along trajectory)
+        BSI_for_nodes = np.empty_like(md)
+        BSI_for_nodes[:] = np.nan
+        BSI_for_nodes[1:] = BSI  # assign each segment's BSI to its lower survey node
+        mask_valid = ~np.isnan(BSI_for_nodes)
+
+        fig3d_bsi = go.Figure()
+        fig3d_bsi.add_trace(go.Scatter3d(
+            x=E, y=N, z=TVD,
+            mode="lines",
+            line=dict(width=4, color="rgba(150,150,150,0.6)"),
+            name="Wellpath"
+        ))
+        fig3d_bsi.add_trace(go.Scatter3d(
+            x=E[mask_valid], y=N[mask_valid], z=TVD[mask_valid],
+            mode="markers",
+            marker=dict(
+                size=5,
+                color=BSI_for_nodes[mask_valid],
+                colorscale="Turbo",
+                cmin=1.0, cmax=4.0,
+                colorbar=dict(title="BSI")
+            ),
+            name="Buckling severity"
+        ))
+        fig3d_bsi.update_layout(
+            title="3D wellpath coloured by buckling severity",
+            height=520,
+            scene=dict(
+                xaxis_title="East (ft)",
+                yaxis_title="North (ft)",
+                zaxis_title="TVD (ft)",
+                zaxis=dict(autorange="reversed")
+            ),
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h"),
+        )
+
+        c5, c6 = st.columns(2)
+        with c5:
+            st.plotly_chart(fig_buck, use_container_width=True)
+        with c6:
+            st.plotly_chart(fig_drag_modes, use_container_width=True)
+
+        c7, c8 = st.columns(2)
+        with c7:
+            st.plotly_chart(fig_bsi, use_container_width=True)
+        with c8:
+            st.plotly_chart(fig_torque_modes, use_container_width=True)
+
+        st.plotly_chart(fig3d_bsi, use_container_width=True)
+
+    # ───────── Friction calibration (history match)
+    st.subheader("Friction calibration (history match at a depth)")
+    cal1, cal2, cal3, cal4 = st.columns(4)
+    fit_depth = cal1.number_input("Depth to fit (MD ft)", 0.0, float(md[-1]), float(min(4000.0, md[-1])), 50.0)
+    meas_pick = cal2.number_input("Measured Pickup HL (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
+    meas_slack= cal3.number_input("Measured Slack-off HL (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
+    meas_rot  = cal4.number_input("Measured Rotating off-bottom HL (lbf)", 0.0, 1_000_000.0, 0.0, 100.0)
+    meas_torque = st.number_input("Measured surface torque (lbf-ft, optional)", 0.0, 200_000.0, 0.0, 100.0)
+
+    with st.expander("Calibration search ranges (μ)"):
+        cA, cB, cC, cD = st.columns(4)
+        mu_c_s_rng = cA.text_input("μ_casing_slide: start,stop,step", "0.15,0.35,0.05")
+        mu_o_s_rng = cB.text_input("μ_open_slide: start,stop,step", "0.25,0.45,0.05")
+        mu_c_r_rng = cC.text_input("μ_casing_rot: start,stop,step", "0.15,0.35,0.05")
+        mu_o_r_rng = cD.text_input("μ_open_rot: start,stop,step", "0.20,0.40,0.05")
+
+    if st.button("Run μ calibration (grid search)"):
+        try:
+            parse = lambda s: tuple(float(x.strip()) for x in s.split(","))
+            mu_ranges = {
+                "mu_c_s": parse(mu_c_s_rng), "mu_o_s": parse(mu_o_s_rng),
+                "mu_c_r": parse(mu_c_r_rng), "mu_o_r": parse(mu_o_r_rng),
+            }
+            best = grid_calibrate_mu(
+                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props, mw_ppg,
+                depth_for_fit=fit_depth,
+                measured_pickup_hl=meas_pick if meas_pick>0 else None,
+                measured_slackoff_hl=meas_slack if meas_slack>0 else None,
+                measured_rotate_hl=meas_rot if meas_rot>0 else None,
+                measured_surface_torque=meas_torque if meas_torque>0 else None,
+                mu_ranges=mu_ranges
+            )
+            if best is None:
+                st.warning("Provide at least one measurement (pickup/slackoff/rotate).")
+            else:
+                st.session_state["μ_fit"] = best
+                st.success(f"Fitted μ: casing(slide)={best['mu_c_s']:.2f}, open(slide)={best['mu_o_s']:.2f}, "
+                           f"casing(rot)={best['mu_c_r']:.2f}, open(rot)={best['mu_o_r']:.2f} (SSE={best['SSE']:.1f})")
+                st.caption("Use the overlay toggle above to compare baseline vs calibrated curves; or copy values into inputs and re-run.")
+        except Exception as e:
+            st.error(f"Calibration failed: {e}")
+
+    st.markdown("### Iteration trace (first 12 rows)")
+    st.dataframe(df_itr.head(12), use_container_width=True)
+
+    st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. Defaults: last casing 9-5/8, OH 8.50 in. "
+               "Tools include history-matching μ, calibrated overlay, NP check, 0.8×MU gate, BSR/SR, tortuosity penalty, motor bit torque, "
+               "and rig-limit margins (per lecture), plus Menand-style buckling loads, mode plots, and a buckling severity indicator (BSI).")

@@ -491,7 +491,7 @@ with tab:
                 f"casing(rot)={mu_fit['mu_c_r']:.2f}, open(rot)={mu_fit['mu_o_r']:.2f}"
             )
 
-    # OPTIONAL: measured torque vs depth CSV (two columns: MD_ft, Torque_kft)
+    # OPTIONAL: measured torque vs depth CSV (two columns: MD_ft, Torque_kft or Torque_ftlbf)
     measured_torque_file = None
     meas_md = None
     meas_tq_kft = None
@@ -658,18 +658,17 @@ with tab:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0)
         )
 
-        # RIGHT: elemental torque + limits (unchanged)
+        # RIGHT: elemental torque + limits (polished)
         fig_right = go.Figure()
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu, mu)
-            if tmu[0] < tmu[-1]: tmu = tmu[::-1]
+            if tmu[0] < tmu[-1]:
+                tmu = tmu[::-1]  # deepest on the right
             fig_right.add_trace(go.Scatter(
                 x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines",
                 line=dict(color=mu_colors.get(mu, None)),
                 hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<extra></extra>"
             ))
-        fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
-        fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
 
         # combined load using pickup tension
         df_pick, T_pick, M_pick = soft_string_stepper(
@@ -679,26 +678,99 @@ with tab:
         )
         F_ax = np.maximum(0.0, df_pick["T_next_lbf"].to_numpy())
         T_allow = T_yield_sf * np.sqrt(np.clip(1.0 - (F_ax/np.maximum(F_tensile_sf,1.0))**2, 0.0, 1.0))
-        fig_right.add_trace(go.Scatter(x=T_allow/1000.0, y=df_pick["md_bot_ft"].to_numpy(), mode="lines",
-                                       name="TJ combined-load limit", line=dict(dash="dot")))
-        fig_right.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-        fig_right.update_xaxes(title_text="Elemental torque (k lbf-ft)")
-        fig_right.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
+
+        # shade "safe" zone left of global combined-load minimum
+        x_allow_min = float(np.nanmin(T_allow/1000.0))
+        fig_right.add_shape(
+            type="rect",
+            x0=0.0, x1=x_allow_min,
+            y0=float(depth.min()), y1=float(depth.max()),
+            fillcolor="rgba(0,255,0,0.05)",
+            line=dict(width=0),
+            layer="below"
+        )
+
+        # limits and rig line
+        fig_right.add_vline(
+            x=T_makeup_sf/1000.0,
+            line_color="#00d5ff",
+            line_dash="dash",
+            annotation_text="Make-up / SF"
+        )
+        fig_right.add_vline(
+            x=rig_torque_lim/1000.0,
+            line_color="magenta",
+            line_dash="dot",
+            annotation_text="Top-drive limit"
+        )
+
+        # combined-load curve
+        fig_right.add_trace(go.Scatter(
+            x=T_allow/1000.0,
+            y=df_pick["md_bot_ft"].to_numpy(),
+            mode="lines",
+            name="TJ combined-load limit",
+            line=dict(color="magenta", dash="dot", width=2)
+        ))
+
+        # annotate string sections like commercial plots
+        x_max = max(rig_torque_lim, T_makeup_sf, float(np.nanmax(T_allow)))/1000.0 * 1.05
+
+        def annotate_section(fig, text, md_top, md_bot, x_ref):
+            y_mid = 0.5*(md_top + md_bot)
+            fig.add_annotation(
+                x=x_ref, y=y_mid,
+                text=text,
+                xanchor="right",
+                showarrow=False,
+                font=dict(size=10)
+            )
+
+        section_labels = {
+            "DC":   f'{dc_od:.1f}" DC',
+            "HWDP": f'{hwdp_od:.1f}" HWDP',
+            "DP":   f'{dp_od:.1f}" DP'
+        }
+        for comp_key, label in section_labels.items():
+            mask = (df_pick["comp"] == comp_key)
+            if mask.any():
+                md_top = float(df_pick.loc[mask, "md_top_ft"].min())
+                md_bot = float(df_pick.loc[mask, "md_bot_ft"].max())
+                annotate_section(fig_right, label, md_top, md_bot, x_max*0.98)
 
         # overlay calibrated (elemental style off-bottom)
         if overlay_calibrated and mu_fit is not None:
             dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
-            if tcal[0] < tcal[-1]: tcal = tcal[::-1]
+            if tcal[0] < tcal[-1]:
+                tcal = tcal[::-1]
             fig_right.add_trace(
                 go.Scatter(x=tcal/1000.0, y=dcal, mode="lines",
                            name="μ (calibrated, elemental)", line=dict(dash="dash"))
             )
 
+        fig_right.update_yaxes(
+            autorange="reversed",
+            title_text="Depth (ft)",
+            showgrid=True,
+            dtick=1000
+        )
+        fig_right.update_xaxes(
+            title_text="Elemental torque (k lbf-ft)",
+            showgrid=True,
+            dtick=5
+        )
+        fig_right.update_layout(
+            title="Elemental Torque vs Depth — μ Sensitivity & TJ Limits",
+            height=700,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h")
+        )
+
         cL, cR = st.columns(2)
         with cL: st.plotly_chart(fig_left, use_container_width=True)
         with cR: st.plotly_chart(fig_right, use_container_width=True)
 
-        # ───────── Envelope & Hookload diagnostics (PHYSICS-ENHANCED)
+        # ───────── Envelope & Buckling diagnostics (PHYSICS-ENHANCED)
         Epsi = 30.0e6
 
         # per-segment local section properties
@@ -739,12 +811,13 @@ with tab:
         # von Mises
         sigma_vm_psi = np.sqrt(sigma_ax_wf**2 + 3.0*tau_psi**2)
 
-        # BSI-like composite
+        # BSI-like composite (1–4)
         SB = sigma_b_psi / 30000.0
         SV = sigma_vm_psi / 60000.0
         SN = np.abs(df_itr["N_lbf"].to_numpy()) / 5000.0
         BSI = 1.0 + 3.0*np.clip(0.35*SB + 0.45*SV + 0.20*SN, 0.0, 1.0)
 
+        # API-style torque–tension envelope (unchanged)
         fig_env = go.Figure()
         F_env = np.linspace(0, TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension, 100)
         T_env = (TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint)*np.sqrt(np.clip(1.0 - (F_env/np.maximum(F_env.max(),1.0))**2, 0.0, 1.0))
@@ -754,22 +827,73 @@ with tab:
                                      name="Operating point", marker=dict(size=10, color="orange")))
         fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
         fig_env.update_yaxes(title_text="Tension (k lbf)")
-        fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
+        fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
 
-        fig_hl = go.Figure()
-        fig_hl.add_trace(go.Scatter(x=np.maximum(0.0, -df_itr['T_next_lbf'].to_numpy())/1000.0, y=depth,
-                                    mode="lines", name="Hookload"))
-        fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
-        fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))
-        fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh", line=dict(dash="dot")))
-        fig_hl.add_trace(go.Scatter(x=BSI, y=depth, name="BSI (1–4)", line=dict(width=4, color="red")))
-        fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-        fig_hl.update_xaxes(title_text="Force / Hookload (k lbf) & BSI")
-        fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
+        # Menand-style buckling impact chart: compression vs Fs/Fh + BSI on x2
+        df_slack, T_slack, _ = soft_string_stepper(
+            md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+            mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
+            mw_ppg, scenario="slackoff", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+        )
+        F_comp = np.maximum(0.0, -df_slack["T_next_lbf"].to_numpy())  # compression positive
+
+        fig_buck = go.Figure()
+
+        fig_buck.add_trace(go.Scatter(
+            x=F_comp/1000.0, y=depth,
+            mode="lines",
+            name="Compressive load (slack-off)",
+            hovertemplate="F: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>",
+            xaxis="x"
+        ))
+        fig_buck.add_trace(go.Scatter(
+            x=Fs/1000.0, y=depth,
+            mode="lines",
+            name="Fs (sinusoidal)",
+            line=dict(dash="dash"),
+            xaxis="x"
+        ))
+        fig_buck.add_trace(go.Scatter(
+            x=Fh/1000.0, y=depth,
+            mode="lines",
+            name="Fh (helical)",
+            line=dict(dash="dot"),
+            xaxis="x"
+        ))
+        fig_buck.add_trace(go.Scatter(
+            x=BSI, y=depth,
+            mode="lines+markers",
+            name="BSI (1–4)",
+            line=dict(width=3, color="red"),
+            xaxis="x2",
+            hovertemplate="BSI: %{x:.2f}<br>MD: %{y:.0f} ft<extra></extra>"
+        ))
+
+        fig_buck.update_yaxes(
+            autorange="reversed",
+            title_text="Depth (ft)"
+        )
+        fig_buck.update_layout(
+            title="Buckling Impact — Compression vs Fs/Fh & BSI",
+            height=420,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h"),
+            xaxis=dict(
+                domain=[0.0, 0.65],
+                title="Compression / Critical load (k lbf)"
+            ),
+            xaxis2=dict(
+                domain=[0.70, 1.0],
+                overlaying="x",
+                side="top",
+                title="BSI (1 = safe, 4 = severe)",
+                range=[1.0, 4.2]
+            )
+        )
 
         c3, c4 = st.columns(2)
         with c3: st.plotly_chart(fig_env, use_container_width=True)
-        with c4: st.plotly_chart(fig_hl,  use_container_width=True)
+        with c4: st.plotly_chart(fig_buck, use_container_width=True)
 
     # ───────── Friction calibration (history match)
     st.subheader("Friction calibration (history match at a depth)")
@@ -818,4 +942,4 @@ with tab:
 
     st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. Defaults: last casing 9-5/8, OH 8.50 in. "
                "Tools include history-matching μ, calibrated overlay, NP check, 0.8×MU gate, BSR/SR, tortuosity penalty, motor bit torque, "
-               "and rig-limit margins (per lecture), plus Menand-style buckling loads and a buckling severity indicator (BSI).")
+               "and rig-limit margins, plus Menand-style buckling loads and a buckling severity indicator (BSI).")

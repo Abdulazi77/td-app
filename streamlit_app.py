@@ -824,7 +824,7 @@ with tab:
         # ───────── NEW: ProWellPlan-style operation comparison ─────────
         st.markdown("### Operation comparison — drag & torque for Lowering / Rotating / Hoisting")
 
-            def run_scenario(scenario_name: str):
+        def run_scenario(scenario_name: str):
             """
             Return:
               depth_s      – MD (ft)

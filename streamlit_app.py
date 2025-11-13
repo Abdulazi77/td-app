@@ -1,4 +1,4 @@
-# /app/main.py
+
 from __future__ import annotations
 import math
 from typing import Dict, Iterable, Tuple, List, Optional
@@ -162,7 +162,7 @@ def soft_string_stepper(
         T[0] = -float(WOB_lbf)       # compressive at bit → negative
         M[0] = float(Mbit_ftlbf)     # motor / bit torque allowed
 
-    # IMPORTANT: include axial body weight on-bottom
+    # include axial body weight for on-bottom (acts like slackoff)
     sgn_ax = {"pickup": +1.0, "slackoff": -1.0, "onbottom": -1.0}.get(scenario, 0.0)
 
     for i in range(nseg):
@@ -204,7 +204,7 @@ def neutral_point_simple(mw_ppg: float, length_from_bit_ft: float) -> float:
     BF = bf_from_mw(mw_ppg)
     return BF * max(0.0, float(length_from_bit_ft))
 
-# NEW: slide-correct NP based on WOB & DC buoyant weight
+# slide-correct NP based on WOB & DC buoyant weight
 def neutral_point_length_from_wob(
     WOB_lbf: float,
     mw_ppg: float,
@@ -241,7 +241,7 @@ def grid_calibrate_mu(
     cased_fit = np.asarray(cased_mask)[:idx]
     comp_fit  = np.asarray(list(comp_along))[:len(md_fit)-1]
 
-    best = None; best_err = 1e99
+    best = None; best_err = 1.0e99
     mu_c_s_rng = np.arange(*mu_ranges["mu_c_s"])
     mu_o_s_rng = np.arange(*mu_ranges["mu_o_s"])
     mu_c_r_rng = np.arange(*mu_ranges["mu_c_r"])
@@ -317,7 +317,7 @@ with tab:
 
     hole_diam_in = cc5.number_input("Open-hole diameter (in)", 4.0, 20.0, 8.50, 0.01)
     shoe_md = float(st.session_state['shoe_md'])
-    cased_mask = md <= shoe_md
+    cased_mask_full = md <= shoe_md
 
     # ───────── 3D split by shoe
     idx = int(np.searchsorted(md, shoe_md, side='right'))
@@ -333,6 +333,7 @@ with tab:
         zaxis=dict(autorange="reversed")
     ), legend=dict(orientation="h"), margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig3d, use_container_width=True)
+    st.caption("**How to read:** 3D trajectory split at the casing shoe. Blue = cased hole, brown = open hole. TVD axis is reversed to show depth downwards.")
 
     # 2D TVD-VS
     st.subheader("2D Wellbore Profile — TVD vs Vertical Section")
@@ -345,6 +346,7 @@ with tab:
                         yaxis=dict(autorange="reversed"), height=360, legend=dict(orientation="h"),
                         margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig2d, use_container_width=True)
+    st.caption("**How to read:** 2D profile of TVD vs. vertical section along the chosen reference azimuth. Useful to sanity-check KOP, build section, tangent and lateral.")
 
     st.dataframe(pd.DataFrame({
         "MD (ft)": md[:11], "Inc (deg)": inc_deg[:11], "Az (deg)": az[:11],
@@ -395,11 +397,26 @@ with tab:
     hwdp_w = w2.number_input("HWDP weight (air, lb/ft)",  5.0,  40.0, 16.0, 0.1)
     dp_w   = w3.number_input("DP weight (air, lb/ft)",    8.0,  40.0, 19.5, 0.1)
 
-    # map string along depth
-    nseg = len(md) - 1
-    comp_along = np.empty(nseg, dtype=object)
-    for i in range(nseg):
-        from_bit = float(md[-1]) - md[i]
+    # ───────── Build the T&D "run" interval limited by string length ─────────
+    total_string_len = dc_len + hwdp_len + dp_len
+    if total_string_len <= 0.0:
+        st.error("Total string length is zero. Increase DC/HWDP/DP lengths.")
+        st.stop()
+
+    start_md = max(0.0, md[-1] - total_string_len)
+    start_idx = int(np.searchsorted(md, start_md, side="left"))
+
+    # Arrays used by the T&D engine (limited to the part of the well actually occupied by the string)
+    md_run      = md[start_idx:]
+    inc_deg_run = inc_deg[start_idx:]
+    az_run      = az[start_idx:]
+    cased_mask  = md_run <= shoe_md
+
+    # map string components along the **run** interval
+    nseg_run = len(md_run) - 1
+    comp_along = np.empty(nseg_run, dtype=object)
+    for i in range(nseg_run):
+        from_bit = float(md_run[-1]) - md_run[i]
         if from_bit <= dc_len: comp_along[i] = "DC"
         elif from_bit <= dc_len + hwdp_len: comp_along[i] = "HWDP"
         else: comp_along[i] = "DP"
@@ -415,9 +432,9 @@ with tab:
     comp_od_in = np.array([comp_map[c][0] for c in comp_along])
     comp_id_in = np.array([comp_map[c][1] for c in comp_along])
 
-    # curvature per-ft
-    _, _, _, DLS = mincurv_positions(md, inc_deg, az)
-    kappa = (DLS*DEG2RAD)/100.0
+    # curvature per-ft for the run interval
+    _, _, _, DLS_run = mincurv_positions(md_run, inc_deg_run, az_run)
+    kappa = (DLS_run*DEG2RAD)/100.0
 
     # scenario + bit torque
     scen = st.selectbox("Scenario", ["Slack-off (RIH)","Pickup (POOH)","Rotate off-bottom","Rotate on-bottom"])
@@ -431,7 +448,7 @@ with tab:
 
     # main run
     df_itr, T_arr, M_arr = soft_string_stepper(
-        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+        md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
         mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
         mw_ppg, scenario=scenario, WOB_lbf=wob, Mbit_ftlbf=Mbit,
         tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
@@ -461,7 +478,7 @@ with tab:
     pull_margin   = rig_pull_lim - surf_hookload
     passed_80 = torque_margin >= 0
     st.info(f"0.8×Make-up = {T80/1000:.1f} k lbf-ft — Surface torque = {surf_torque/1000:.2f} k → {'PASS ✅' if passed_80 else 'FAIL ❌'} (margin {torque_margin/1000:.2f} k)")
-    st.caption("Why this? The lecture recommends staying ≤ ~80% of TJ make-up; it’s a conservative gate.")
+    st.caption("Why this? Industry practice is to stay ≤ ~80% of tool-joint make-up torque as a conservative gate.")
 
     # ───────── Neutral point — slide formula (analytic) + model sign-change
     st.subheader("Neutral Point (NP)")
@@ -481,21 +498,21 @@ with tab:
     st.write(f"Current DC length = **{dc_len:,.0f} ft** → "
              f"{'✅ OK' if dc_len >= Lc_req else '⚠️ Too short — increase DC length'}")
 
-    # Model sign-change (Johancsik)
+    # Model sign-change (Johancsik) run on the **same run interval**
     df_on, T_on, _ = soft_string_stepper(
-        md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+        md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
         mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
         mw_ppg, scenario="onbottom", WOB_lbf=wob, Mbit_ftlbf=Mbit,
         tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
     )
-    np_md = neutral_point_md(md, np.array(T_on))
+    np_md = neutral_point_md(md_run, np.array(T_on))
     if math.isnan(np_md):
         st.info("Johancsik model: no sign change (entire string compressive near bit). Compare against analytical NP above.")
     else:
-        NP_from_bit_model = md[-1] - np_md
+        NP_from_bit_model = md_run[-1] - np_md
         st.write(
             f"T&D model NP (incl. friction): **{NP_from_bit_model:,.0f} ft from bit** "
-            f"(full string)."
+            f"(full string in hole)."
         )
         st.caption(f"Expect differences vs analytic NP if deviation/friction is significant.")
 
@@ -557,6 +574,7 @@ with tab:
         c1x, c2x = st.columns(2)
         with c1x: st.plotly_chart(figT, use_container_width=True)
         with c2x: st.plotly_chart(figH, use_container_width=True)
+        st.caption("**How to read:** Simple profiles of surface torque and hookload vs depth for the current scenario.")
     else:
         st.markdown("### T&D Model Chart — Risk curves and limits")
         mu_band = st.multiselect(
@@ -581,16 +599,16 @@ with tab:
 
         def run_td_off_bottom(mu_slide: float, mu_rot: float):
             df_tmp, T_tmp, M_tmp = soft_string_stepper(
-                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+                md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
                 mu_slide, mu_slide, mu_rot, mu_rot, mw_ppg, scenario="rotate_off",
                 tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
             )
             return df_tmp["md_bot_ft"].to_numpy(), np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
 
-        # NEW: pickup drag sensitivity
+        # pickup drag sensitivity
         def run_drag_pickup(mu_slide: float):
             df_tmp, T_tmp, _ = soft_string_stepper(
-                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+                md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
                 mu_slide, mu_slide, mu_slide, mu_slide, mw_ppg,
                 scenario="pickup",
                 tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
@@ -650,7 +668,7 @@ with tab:
 
         # combined load using pickup tension
         df_pick, T_pick, M_pick = soft_string_stepper(
-            md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+            md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
             mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot, mw_ppg,
             scenario="pickup", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
         )
@@ -670,6 +688,7 @@ with tab:
         cL, cR = st.columns(2)
         with cL: st.plotly_chart(fig_left, use_container_width=True)
         with cR: st.plotly_chart(fig_right, use_container_width=True)
+        st.caption("**How to read (left):** Each curve is a different μ assumption (higher μ → higher torque). Shaded bands show 0.8×MU safe region, top-drive limit and a red no-go zone. Dotted line marks shoe depth. Optional markers show measured torque.\n\n**How to read (right):** Elemental (downhole) torque vs depth with a tool-joint combined-load limit curve (dotted). Crossing it indicates potential connection overstress.")
 
         # ───────── Envelope & Hookload diagnostics ─────────
         Epsi = 30.0e6
@@ -718,6 +737,7 @@ with tab:
         fig_env.update_xaxes(title_text="Torque (k lbf-ft)")
         fig_env.update_yaxes(title_text="Tension (k lbf)")
         fig_env.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10))
+        st.plotly_chart(fig_env, use_container_width=True)
 
         fig_hl = go.Figure()
         hookload_along = np.abs(df_itr['T_next_lbf'].to_numpy())/1000.0
@@ -729,12 +749,10 @@ with tab:
         fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_hl.update_xaxes(title_text="Hookload / Fs / Fh (k lbf) & BSI")
         fig_hl.update_layout(height=420, margin=dict(l=10,r=10,t=30,b=10), legend=dict(orientation="h"))
+        st.plotly_chart(fig_hl,  use_container_width=True)
+        st.caption("**How to read:** Left plot: torque–tension operating point vs an approximate API RP 7G envelope (elliptic interaction). Right plot: hookload vs depth with sinusoidal/helical buckling thresholds and a heuristic Buckling Severity Index (BSI).")
 
-        c3, c4 = st.columns(2)
-        with c3: st.plotly_chart(fig_env, use_container_width=True)
-        with c4: st.plotly_chart(fig_hl,  use_container_width=True)
-
-        # ───────── NEW: Drag μ-sensitivity (tension vs depth) ─────────
+        # ───────── Drag μ-sensitivity (tension vs depth) ─────────
         st.markdown("### Drag μ-sensitivity — Drillstring tension vs depth")
 
         fig_drag = go.Figure()
@@ -785,9 +803,11 @@ with tab:
         )
 
         st.plotly_chart(fig_drag, use_container_width=True)
+        st.caption("**How to read:** Pickup tension vs depth for several μ values. Curves to the right indicate higher drag. Compare against buckling thresholds and the pipe-body tension limit.")
+
         # ───────── Baseline (friction-free) hookload for drag reference ─────────
         df_free, T_free, _ = soft_string_stepper(
-            md, inc_deg, kappa, (md <= shoe_md), comp_along, comp_props,
+            md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
             0.0, 0.0, 0.0, 0.0, mw_ppg,
             scenario="pickup", WOB_lbf=0.0, Mbit_ftlbf=0.0,
             tortuosity_mode="off", tau=0.0, mu_open_boost=0.0
@@ -799,7 +819,7 @@ with tab:
 
         def run_scenario(scenario_name: str):
             df_s, T_s, M_s = soft_string_stepper(
-                md, inc_deg, kappa, (md <= shoe_md), comp_along, comp_props,
+                md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
                 mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
                 mw_ppg, scenario=scenario_name, WOB_lbf=wob, Mbit_ftlbf=Mbit,
                 tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
@@ -825,6 +845,7 @@ with tab:
         fig_drag_ops.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_drag_ops.update_xaxes(title_text="Drag force (kN)")
         fig_drag_ops.update_layout(height=450, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
+        st.plotly_chart(fig_drag_ops, use_container_width=True)
 
         fig_tq_ops = go.Figure()
         fig_tq_ops.add_trace(go.Scatter(x=tq_low, y=depth_low, mode="lines", name="Lowering"))
@@ -833,16 +854,14 @@ with tab:
         fig_tq_ops.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_tq_ops.update_xaxes(title_text="Torque (kN·m)")
         fig_tq_ops.update_layout(height=450, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
-
-        c_ops1, c_ops2 = st.columns(2)
-        with c_ops1: st.plotly_chart(fig_drag_ops, use_container_width=True)
-        with c_ops2: st.plotly_chart(fig_tq_ops, use_container_width=True)
+        st.plotly_chart(fig_tq_ops, use_container_width=True)
+        st.caption("**How to read:** Direct comparison of drag and torque by operation. Higher curves indicate a harder trip; check limits above.")
 
         # ───────── Advanced buckling views ─────────
         st.markdown("### Advanced buckling views (compression, BSI & 3D severity)")
 
         df_slack, T_slack, _ = soft_string_stepper(
-            md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+            md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
             mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot, mw_ppg,
             scenario="slackoff", tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
         )
@@ -861,6 +880,7 @@ with tab:
         fig_buck.update_xaxes(title_text="Compression / critical load (k lbf)")
         fig_buck.update_layout(title="Compression vs critical buckling loads — sliding / RIH", height=500,
                                margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
+        st.plotly_chart(fig_buck, use_container_width=True)
 
         BSI_clipped = np.clip(BSI, 1.0, 4.0)
         fig_bsi = go.Figure()
@@ -874,22 +894,22 @@ with tab:
                               xaxis=dict(domain=[0.0, 0.45], title="Buckling Severity Index ν (1 = low, 4 = severe)", range=[1.0, 4.1]),
                               xaxis2=dict(domain=[0.55, 1.0], overlaying="x", side="top", title="Hookload (k lbf)"),
                               yaxis=dict(autorange="reversed", title="Depth (ft)", dtick=1000))
+        st.plotly_chart(fig_bsi, use_container_width=True)
 
         fig3d_bsi = go.Figure()
-        BSI_for_nodes = np.empty_like(md); BSI_for_nodes[:] = np.nan; BSI_for_nodes[1:] = BSI
+        BSI_for_nodes = np.empty_like(md_run); BSI_for_nodes[:] = np.nan; BSI_for_nodes[1:] = BSI
         mask_valid = ~np.isnan(BSI_for_nodes)
-        fig3d_bsi.add_trace(go.Scatter3d(x=E, y=N, z=TVD, mode="lines", line=dict(width=4, color="rgba(200,200,200,0.4)"), name="Wellpath"))
-        fig3d_bsi.add_trace(go.Scatter3d(x=E[mask_valid], y=N[mask_valid], z=TVD[mask_valid], mode="markers",
+        # plot along the run interval in 3D using the original coordinates subset
+        E_run, N_run, TVD_run = E[start_idx:], N[start_idx:], TVD[start_idx:]
+        fig3d_bsi.add_trace(go.Scatter3d(x=E_run, y=N_run, z=TVD_run, mode="lines", line=dict(width=4, color="rgba(200,200,200,0.4)"), name="Wellpath (run)"))
+        fig3d_bsi.add_trace(go.Scatter3d(x=E_run[mask_valid], y=N_run[mask_valid], z=TVD_run[mask_valid], mode="markers",
                                          marker=dict(size=5, color=BSI_for_nodes[mask_valid], colorscale="Turbo", cmin=1.0, cmax=4.0,
                                                      colorbar=dict(title="BSI"), opacity=0.9), name="Buckling severity"))
-        fig3d_bsi.update_layout(title="3D wellpath coloured by buckling severity", height=520,
+        fig3d_bsi.update_layout(title="3D wellpath coloured by buckling severity (run interval)", height=520,
                                 scene=dict(xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)", zaxis=dict(autorange="reversed"), bgcolor="black"),
                                 paper_bgcolor="black", font=dict(color="white"), margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
-
-        c5, c6 = st.columns(2)
-        with c5: st.plotly_chart(fig_buck, use_container_width=True)
-        with c6: st.plotly_chart(fig_bsi, use_container_width=True)
         st.plotly_chart(fig3d_bsi, use_container_width=True)
+        st.caption("**How to read:** Left: compression vs critical loads. Middle: BSI (1–4) with hookload on a twin x-axis. Bottom: the same BSI shown along the 3D path of the portion of the well occupied by the string.")
 
     # ───────── Friction calibration (history match)
     st.subheader("Friction calibration (history match at a depth)")
@@ -915,7 +935,7 @@ with tab:
                 "mu_c_r": parse(mu_c_r_rng), "mu_o_r": parse(mu_o_r_rng),
             }
             best = grid_calibrate_mu(
-                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props, mw_ppg,
+                md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props, mw_ppg,
                 depth_for_fit=fit_depth,
                 measured_pickup_hl=meas_pick if meas_pick>0 else None,
                 measured_slackoff_hl=meas_slack if meas_slack>0 else None,
@@ -936,5 +956,4 @@ with tab:
     st.markdown("### Iteration trace (first 12 rows)")
     st.dataframe(df_itr.head(12), use_container_width=True)
 
-    st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. Defaults: last casing 9-5/8, OH 8.50 in. "
-               "Tools include…")
+    st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. The T&D engine only runs over the part of the well actually occupied by the string (DC + HWDP + DP lengths).")

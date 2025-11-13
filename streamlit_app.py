@@ -31,7 +31,7 @@ def A_in2(od_in: float, id_in: float) -> float: return (math.pi/4.0)*(od_in**2 -
 def J_in4(od_in: float, id_in: float) -> float: return (math.pi/32.0)*(od_in**4 - id_in**4)
 
 def EI_lbf_ft2_from_in4(Epsi_lbf_in2: float, I_in4_val: float) -> float:
-    "\"\"Convert E (psi) * I (in^4) to EI (lbf·ft^2).\"\"\"
+    Convert E (psi) * I (in^4) to EI (lbf·ft^2)
     EI_lbf_in2 = Epsi_lbf_in2 * I_in4_val
     return EI_lbf_in2 / (12.0**2)
 

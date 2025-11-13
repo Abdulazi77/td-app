@@ -1,3 +1,8 @@
+# Write the provided code block to a plain text file exactly as-is (with the single fix: remove the leading
+# explanatory comment lines so the script can be run directly with Python to generate the output file).
+#
+# File will be saved at /mnt/data/streamlit_app_with_NP_simple.txt
+
 from __future__ import annotations
 import math
 from typing import Dict, Iterable, Tuple, List, Optional
@@ -26,7 +31,7 @@ def A_in2(od_in: float, id_in: float) -> float: return (math.pi/4.0)*(od_in**2 -
 def J_in4(od_in: float, id_in: float) -> float: return (math.pi/32.0)*(od_in**4 - id_in**4)
 
 def EI_lbf_ft2_from_in4(Epsi_lbf_in2: float, I_in4_val: float) -> float:
-    """Convert E (psi) * I (in^4) to EI (lbf·ft^2)."""
+    \"\"\"Convert E (psi) * I (in^4) to EI (lbf·ft^2).\"\"\"
     EI_lbf_in2 = Epsi_lbf_in2 * I_in4_val
     return EI_lbf_in2 / (12.0**2)
 
@@ -112,11 +117,11 @@ def soft_string_stepper(
     tau: float = 0.0,                # 0.0 .. 0.5 typ
     mu_open_boost: float = 0.0,      # hole cleaning booster
 ):
-    """
+    \"\"\"
     Δs = 1 ft soft-string integration, bit -> surface.
     scenario: "pickup" | "slackoff" | "rotate_off" | "onbottom"
     tortuosity_mode: inflate kappa or mu by (1+tau) in OPEN-HOLE segments.
-    """
+    \"\"\"
     ds = 1.0
     md = np.asarray(md); inc_deg = np.asarray(inc_deg)
     nseg = len(md) - 1
@@ -186,7 +191,7 @@ def soft_string_stepper(
 
 # ───────────────────── Helper diagnostics ────────────────────────
 def neutral_point_md(md: np.ndarray, T_arr: np.ndarray) -> float:
-    """Return MD where axial force crosses zero (bit→surface array). NaN if none."""
+    \"\"\"Return MD where axial force crosses zero (bit→surface array). NaN if none.\"\"\"
     if len(md) < 2 or len(T_arr) < 2: return float('nan')
     for i in range(len(T_arr)-1):
         t1, t2 = T_arr[i], T_arr[i+1]
@@ -196,6 +201,12 @@ def neutral_point_md(md: np.ndarray, T_arr: np.ndarray) -> float:
             return md[i] + frac*(md[i+1]-md[i])
     return float('nan')
 
+# NEW (slides): simple neutral point estimate z_NP = BF * L
+def neutral_point_simple(mw_ppg: float, length_from_bit_ft: float) -> float:
+    \"\"\"Slide-style neutral point: BF * L (no sign change required).\"\"\"
+    BF = bf_from_mw(mw_ppg)
+    return BF * max(0.0, float(length_from_bit_ft))
+
 def grid_calibrate_mu(
     md, inc_deg, kappa, cased_mask, comp_along, comp_props, mw_ppg,
     depth_for_fit: float,
@@ -203,7 +214,7 @@ def grid_calibrate_mu(
     measured_rotate_hl: Optional[float], measured_surface_torque: Optional[float],
     mu_ranges: Dict[str, Tuple[float,float,float]],
 ):
-    """Very simple grid search across μ ranges; returns best μ dict or None."""
+    \"\"\"Very simple grid search across μ ranges; returns best μ dict or None.\"\"\"
     targets = []
     if measured_pickup_hl is not None:   targets.append("pickup")
     if measured_slackoff_hl is not None: targets.append("slackoff")
@@ -287,7 +298,7 @@ with tab:
 
     if 'shoe_md' not in st.session_state:
         st.session_state['shoe_md'] = min(3000.0, md_end)
-    st.session_state['shoe_md'] = clamp(float(st.session_state['shoe_md']), 0.0, md_end)
+    st.session_state['shoe_md'] = float(min(max(st.session_state['shoe_md'], 0.0), md_end))
     st.session_state['shoe_md'] = cc4.slider("Shoe MD (ft)", 0.0, md_end, float(st.session_state['shoe_md']), 50.0)
 
     hole_diam_in = cc5.number_input("Open-hole diameter (in)", 4.0, 20.0, 8.50, 0.01)
@@ -330,12 +341,12 @@ with tab:
     # ───────── T&D Inputs
     st.subheader("Soft-string Torque & Drag — Johancsik (linked to survey above)")
     with st.expander("Typical μ starting ranges (lecture hints)"):
-        st.markdown("""
+        st.markdown(\"\"\"
 - **Casing (WBM):** 0.15 – 0.25 (sliding/rotating similar)  
 - **Open-hole (WBM):** 0.25 – 0.40 (can be higher when cleaning is poor)  
 - **OBM/SBM:** often lower than WBM  
 > Use **history matching** to calibrate for your well/section.
-""")
+\"\"\")
 
     mu_cased_slide = st.number_input("μ in casing (sliding)", 0.05, 0.80, 0.25, 0.01)
     mu_open_slide  = st.number_input("μ in open-hole (sliding)", 0.05, 0.80, 0.35, 0.01)
@@ -435,11 +446,10 @@ with tab:
     torque_margin = T80 - surf_torque
     pull_margin   = rig_pull_lim - surf_hookload
     passed_80 = torque_margin >= 0
-    st.info(f"0.8×Make-up = {T80/1000:.1f} k lbf-ft — Surface torque = {surf_torque/1000:.2f} k → "
-            f"{'PASS ✅' if passed_80 else 'FAIL ❌'} (margin {torque_margin/1000:.2f} k)")
+    st.info(f"0.8×Make-up = {T80/1000:.1f} k lbf-ft — Surface torque = {surf_torque/1000:.2f} k → {'PASS ✅' if passed_80 else 'FAIL ❌'} (margin {torque_margin/1000:.2f} k)")
     st.caption("Why this? The lecture recommends staying ≤ ~80% of TJ make-up; it’s a conservative gate.")
 
-    # Neutral point from on-bottom run
+    # Neutral point — model sign-change AND slide formula
     df_on, T_on, _ = soft_string_stepper(
         md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
         mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
@@ -447,12 +457,19 @@ with tab:
         tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
     )
     np_md = neutral_point_md(md, np.array(T_on))
+    # slide-style estimate: L = string length in hole (limited by MD)
+    L_string = min(float(md[-1]), float(dc_len + hwdp_len + dp_len))
+    np_simple_from_bit = neutral_point_simple(mw_ppg, L_string)  # BF * L
+
     if math.isnan(np_md):
-        st.warning("Neutral point not found (no sign change in axial).")
+        st.warning("Neutral point not found by sign-change. Using slide formula (BF × L).")
+        st.write(f"Neutral point (slide formula) ≈ **{np_simple_from_bit:,.0f} ft from bit**  (BF={bf_from_mw(mw_ppg):.4f}, L={L_string:,.0f} ft)")
     else:
         NP_from_bit = md[-1] - np_md
+        st.write(f"Neutral point (model) ≈ **{NP_from_bit:,.0f} ft from bit**")
+        st.caption(f"Slide formula check → BF×L ≈ {np_simple_from_bit:,.0f} ft (BF={bf_from_mw(mw_ppg):.4f}, L={L_string:,.0f} ft)")
         in_DCs = NP_from_bit <= dc_len
-        st.write(f"Neutral point depth from bit ≈ **{NP_from_bit:,.0f} ft** → {'✅ inside DCs' if in_DCs else '❌ not inside DCs'}")
+        st.write(f"→ {'✅ inside DCs' if in_DCs else '❌ not inside DCs'}")
         if not in_DCs:
             st.warning("Increase DC length so NP sits inside the collars for current WOB.")
 
@@ -484,7 +501,7 @@ with tab:
                 f"casing(rot)={mu_fit['mu_c_r']:.2f}, open(rot)={mu_fit['mu_o_r']:.2f}"
             )
 
-    # OPTIONAL: measured torque vs depth CSV (two columns: MD_ft, Torque_kft)
+    # OPTIONAL: measured torque vs depth CSV overlay
     measured_torque_file = None
     meas_md = None
     meas_tq_kft = None
@@ -562,111 +579,46 @@ with tab:
         x_safe_max = T_makeup_sf/1000.0
         x_warn_max = rig_torque_lim/1000.0
 
-        fig_left.add_shape(
-            type="rect",
-            x0=0, x1=x_safe_max, y0=min(depth), y1=max(depth),
-            fillcolor="rgba(0,128,0,0.05)", line_width=0, layer="below"
-        )
-        fig_left.add_shape(
-            type="rect",
-            x0=x_safe_max, x1=x_warn_max, y0=min(depth), y1=max(depth),
-            fillcolor="rgba(255,165,0,0.06)", line_width=0, layer="below"
-        )
-        fig_left.add_shape(
-            type="rect",
-            x0=x_warn_max, x1=x_warn_max*1.3, y0=min(depth), y1=max(depth),
-            fillcolor="rgba(255,0,0,0.05)", line_width=0, layer="below"
-        )
+        fig_left.add_shape(type="rect", x0=0, x1=x_safe_max, y0=min(depth), y1=max(depth),
+                           fillcolor="rgba(0,128,0,0.05)", line_width=0, layer="below")
+        fig_left.add_shape(type="rect", x0=x_safe_max, x1=x_warn_max, y0=min(depth), y1=max(depth),
+                           fillcolor="rgba(255,165,0,0.06)", line_width=0, layer="below")
+        fig_left.add_shape(type="rect", x0=x_warn_max, x1=x_warn_max*1.3, y0=min(depth), y1=max(depth),
+                           fillcolor="rgba(255,0,0,0.05)", line_width=0, layer="below")
 
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu, mu)
-            fig_left.add_trace(go.Scatter(
-                x=tmu/1000.0,
-                y=dmu,
-                name=f"μ={mu:.2f}",
-                mode="lines",
-                line=dict(color=mu_colors.get(mu, None)),
-                customdata=np.full_like(dmu, mu, dtype=float),
-                hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<br>μ=%{customdata:.2f}<extra></extra>"
-            ))
+            fig_left.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines",
+                                          line=dict(color=mu_colors.get(mu, None)),
+                                          customdata=np.full_like(dmu, mu, dtype=float),
+                                          hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<br>μ=%{customdata:.2f}<extra></extra>"))
 
         if overlay_calibrated and mu_fit is not None:
             dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
-            fig_left.add_trace(
-                go.Scatter(
-                    x=tcal/1000.0,
-                    y=dcal,
-                    mode="lines",
-                    name="μ (calibrated, off-bottom)",
-                    line=dict(dash="dash", width=3)
-                )
-            )
+            fig_left.add_trace(go.Scatter(x=tcal/1000.0, y=dcal, mode="lines", name="μ (calibrated, off-bottom)", line=dict(dash="dash", width=3)))
 
-        fig_left.add_vline(
-            x=T_makeup_sf/1000.0,
-            line_color="#00d5ff",
-            line_dash="dash",
-            annotation_text="Make-up / SF",
-            annotation_position="top"
-        )
-        fig_left.add_vline(
-            x=rig_torque_lim/1000.0,
-            line_color="magenta",
-            line_dash="dot",
-            annotation_text="TD limit",
-            annotation_position="top"
-        )
-
-        fig_left.add_hline(
-            y=shoe_md,
-            line_dash="dot",
-            line_color="#888888",
-            annotation_text="Shoe depth",
-            annotation_position="right"
-        )
+        fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF", annotation_position="top")
+        fig_left.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="TD limit", annotation_position="top")
+        fig_left.add_hline(y=shoe_md, line_dash="dot", line_color="#888888", annotation_text="Shoe depth", annotation_position="right")
 
         if meas_md is not None and meas_tq_kft is not None:
-            fig_left.add_trace(
-                go.Scatter(
-                    x=meas_tq_kft,
-                    y=meas_md,
-                    mode="markers+lines",
-                    name="Measured torque",
-                    marker=dict(symbol="circle-open", size=7),
-                    line=dict(width=1, dash="dot"),
-                    hovertemplate="Measured: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<extra></extra>"
-                )
-            )
+            fig_left.add_trace(go.Scatter(x=meas_tq_kft, y=meas_md, mode="markers+lines", name="Measured torque",
+                                          marker=dict(symbol="circle-open", size=7), line=dict(width=1, dash="dot"),
+                                          hovertemplate="Measured: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<extra></extra>"))
 
-        fig_left.update_yaxes(
-            autorange="reversed",
-            title_text="Depth (ft)",
-            dtick=1000,
-            showgrid=True
-        )
-        fig_left.update_xaxes(
-            title_text="Off-bottom torque (k lbf-ft)",
-            tickformat=".1f",
-            showgrid=True
-        )
-        fig_left.update_layout(
-            title="Surface Torque vs Depth — Off-bottom μ Sensitivity",
-            height=680,
-            margin=dict(l=10, r=10, t=40, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0)
-        )
+        fig_left.update_yaxes(autorange="reversed", title_text="Depth (ft)", dtick=1000, showgrid=True)
+        fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)", tickformat=".1f", showgrid=True)
+        fig_left.update_layout(title="Surface Torque vs Depth — Off-bottom μ Sensitivity", height=680,
+                               margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0))
 
         # RIGHT: elemental torque + limits
         fig_right = go.Figure()
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu, mu)
-            if tmu[0] < tmu[-1]:
-                tmu = tmu[::-1]
-            fig_right.add_trace(go.Scatter(
-                x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines",
-                line=dict(color=mu_colors.get(mu, None)),
-                hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<extra></extra>"
-            ))
+            if tmu[0] < tmu[-1]: tmu = tmu[::-1]
+            fig_right.add_trace(go.Scatter(x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines",
+                                           line=dict(color=mu_colors.get(mu, None)),
+                                           hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<extra></extra>"))
         fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
         fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")
 
@@ -686,12 +638,8 @@ with tab:
 
         if overlay_calibrated and mu_fit is not None:
             dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
-            if tcal[0] < tcal[-1]:
-                tcal = tcal[::-1]
-            fig_right.add_trace(
-                go.Scatter(x=tcal/1000.0, y=dcal, mode="lines",
-                           name="μ (calibrated, elemental)", line=dict(dash="dash"))
-            )
+            if tcal[0] < tcal[-1]: tcal = tcal[::-1]
+            fig_right.add_trace(go.Scatter(x=tcal/1000.0, y=dcal, mode="lines", name="μ (calibrated, elemental)", line=dict(dash="dash")))
 
         cL, cR = st.columns(2)
         with cL: st.plotly_chart(fig_left, use_container_width=True)
@@ -746,8 +694,7 @@ with tab:
 
         fig_hl = go.Figure()
         hookload_along = np.abs(df_itr['T_next_lbf'].to_numpy())/1000.0
-        fig_hl.add_trace(go.Scatter(x=hookload_along, y=depth,
-                                    mode="lines", name="Hookload (|T|)"))
+        fig_hl.add_trace(go.Scatter(x=hookload_along, y=depth, mode="lines", name="Hookload (|T|)"))
         fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
         fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))
         fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh", line=dict(dash="dot")))
@@ -812,7 +759,6 @@ with tab:
 
         st.plotly_chart(fig_drag, use_container_width=True)
         # ───────── Baseline (friction-free) hookload for drag reference ─────────
-        # This represents the buoyed string weight with μ = 0 (no drag).
         df_free, T_free, _ = soft_string_stepper(
             md, inc_deg, kappa, (md <= shoe_md), comp_along, comp_props,
             0.0, 0.0, 0.0, 0.0, mw_ppg,
@@ -821,38 +767,25 @@ with tab:
         )
         HL_free = np.abs(df_free["T_next_lbf"].to_numpy())
 
-        # ───────── NEW: ProWellPlan-style operation comparison ─────────
+        # ───────── Operation comparison — drag & torque for Lowering / Rotating / Hoisting ─────────
         st.markdown("### Operation comparison — drag & torque for Lowering / Rotating / Hoisting")
 
         def run_scenario(scenario_name: str):
-            """
-            Return:
-              depth_s      – MD (ft)
-              drag_kN      – |HL_scenario - HL_free| in kN  (drag)
-              tor_kNm      – |M| in kN·m
-            """
             df_s, T_s, M_s = soft_string_stepper(
                 md, inc_deg, kappa, (md <= shoe_md), comp_along, comp_props,
                 mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
                 mw_ppg, scenario=scenario_name, WOB_lbf=wob, Mbit_ftlbf=Mbit,
                 tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
             )
-
             depth_s = df_s["md_bot_ft"].to_numpy()
             HL_s    = np.abs(df_s["T_next_lbf"].to_numpy())
-
-            # Make sure we’re aligned with the friction-free baseline
             n = min(len(HL_s), len(HL_free))
             HL_s    = HL_s[:n]
             depth_s = depth_s[:n]
             M_s_arr = np.abs(df_s["M_next_lbf_ft"].to_numpy())[:n]
-
-            # DRAG = difference between actual HL and friction-free HL
             drag_kN = np.abs(HL_s - HL_free[:n]) * LBF_TO_KN
             tor_kNm = M_s_arr * LBF_FT_TO_KNM
-
             return depth_s, drag_kN, tor_kNm
-
 
         depth_low, drag_low, tq_low = run_scenario("slackoff")
         depth_rot, drag_rot, tq_rot = run_scenario("rotate_off")
@@ -875,10 +808,8 @@ with tab:
         fig_tq_ops.update_layout(height=450, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
 
         c_ops1, c_ops2 = st.columns(2)
-        with c_ops1:
-            st.plotly_chart(fig_drag_ops, use_container_width=True)
-        with c_ops2:
-            st.plotly_chart(fig_tq_ops, use_container_width=True)
+        with c_ops1: st.plotly_chart(fig_drag_ops, use_container_width=True)
+        with c_ops2: st.plotly_chart(fig_tq_ops, use_container_width=True)
 
         # ───────── Advanced buckling views ─────────
         st.markdown("### Advanced buckling views (compression, BSI & 3D severity)")
@@ -891,120 +822,46 @@ with tab:
         depth_slack = df_slack["md_bot_ft"].to_numpy()
         T_slack_ax = df_slack["T_next_lbf"].to_numpy()
 
-        # For this stepper, slackoff gives T < 0 in tension, T > 0 in compression
         F_comp = np.maximum(0.0, T_slack_ax)          # compression magnitude
         hookload_profile = np.abs(T_slack_ax)         # tension magnitude
 
-        # (1) Compression vs Fs/Fh
         fig_buck = go.Figure()
-        fig_buck.add_trace(go.Scatter(
-            x=F_comp/1000.0, y=depth_slack,
-            mode="lines", name="Compressive load (slackoff)",
-            hovertemplate="F: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"
-        ))
-        fig_buck.add_trace(go.Scatter(
-            x=Fs/1000.0, y=depth,
-            mode="lines", name="Fs (sinusoidal)", line=dict(dash="dash")
-        ))
-        fig_buck.add_trace(go.Scatter(
-            x=Fh/1000.0, y=depth,
-            mode="lines", name="Fh (helical)", line=dict(dash="dot")
-        ))
+        fig_buck.add_trace(go.Scatter(x=F_comp/1000.0, y=depth_slack, mode="lines", name="Compressive load (slackoff)",
+                                      hovertemplate="F: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"))
+        fig_buck.add_trace(go.Scatter(x=Fs/1000.0, y=depth, mode="lines", name="Fs (sinusoidal)", line=dict(dash="dash")))
+        fig_buck.add_trace(go.Scatter(x=Fh/1000.0, y=depth, mode="lines", name="Fh (helical)", line=dict(dash="dot")))
         fig_buck.update_yaxes(autorange="reversed", title_text="Depth (ft)", dtick=1000)
         fig_buck.update_xaxes(title_text="Compression / critical load (k lbf)")
-        fig_buck.update_layout(
-            title="Compression vs critical buckling loads — sliding / RIH",
-            height=500,
-            margin=dict(l=10, r=10, t=40, b=10),
-            legend=dict(orientation="h")
-        )
+        fig_buck.update_layout(title="Compression vs critical buckling loads — sliding / RIH", height=500,
+                               margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
 
-        # (2) Hookload & BSI vs depth (Fig.8 style)
         BSI_clipped = np.clip(BSI, 1.0, 4.0)
         fig_bsi = go.Figure()
-        fig_bsi.add_trace(go.Scatter(
-            x=BSI_clipped, y=depth,
-            mode="lines",
-            name="BSI",
-            line=dict(width=4),
-            hovertemplate="BSI: %{x:.2f}<br>MD: %{y:.0f} ft<extra></extra>"
-        ))
-        fig_bsi.add_trace(go.Scatter(
-            x=hookload_profile/1000.0, y=depth_slack,
-            xaxis="x2",
-            mode="lines",
-            name="Hookload (slackoff)",
-            line=dict(color="royalblue"),
-            hovertemplate="HL: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"
-        ))
-        fig_bsi.update_layout(
-            title="Hookload & Buckling Severity Index while sliding",
-            height=500,
-            margin=dict(l=10, r=10, t=40, b=10),
-            legend=dict(orientation="h"),
-            xaxis=dict(
-                domain=[0.0, 0.45],
-                title="Buckling Severity Index ν (1 = low, 4 = severe)",
-                range=[1.0, 4.1]
-            ),
-            xaxis2=dict(
-                domain=[0.55, 1.0],
-                overlaying="x",
-                side="top",
-                title="Hookload (k lbf)"
-            ),
-            yaxis=dict(autorange="reversed", title="Depth (ft)", dtick=1000),
-        )
-
-        # (3) 3D wellpath coloured by BSI
-        BSI_for_nodes = np.empty_like(md)
-        BSI_for_nodes[:] = np.nan
-        BSI_for_nodes[1:] = BSI
-
-        mask_valid = ~np.isnan(BSI_for_nodes)
+        fig_bsi.add_trace(go.Scatter(x=BSI_clipped, y=depth, mode="lines", name="BSI", line=dict(width=4),
+                                     hovertemplate="BSI: %{x:.2f}<br>MD: %{y:.0f} ft<extra></extra>"))
+        fig_bsi.add_trace(go.Scatter(x=hookload_profile/1000.0, y=depth_slack, xaxis="x2", mode="lines",
+                                     name="Hookload (slackoff)", line=dict(color="royalblue"),
+                                     hovertemplate="HL: %{x:.2f} k-lbf<br>MD: %{y:.0f} ft<extra></extra>"))
+        fig_bsi.update_layout(title="Hookload & Buckling Severity Index while sliding", height=500,
+                              margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"),
+                              xaxis=dict(domain=[0.0, 0.45], title="Buckling Severity Index ν (1 = low, 4 = severe)", range=[1.0, 4.1]),
+                              xaxis2=dict(domain=[0.55, 1.0], overlaying="x", side="top", title="Hookload (k lbf)"),
+                              yaxis=dict(autorange="reversed", title="Depth (ft)", dtick=1000))
 
         fig3d_bsi = go.Figure()
-        fig3d_bsi.add_trace(go.Scatter3d(
-            x=E, y=N, z=TVD,
-            mode="lines",
-            line=dict(width=4, color="rgba(200,200,200,0.4)"),
-            name="Wellpath"
-        ))
-        fig3d_bsi.add_trace(go.Scatter3d(
-            x=E[mask_valid], y=N[mask_valid], z=TVD[mask_valid],
-            mode="markers",
-            marker=dict(
-                size=5,
-                color=BSI_for_nodes[mask_valid],
-                colorscale="Turbo",
-                cmin=1.0, cmax=4.0,
-                colorbar=dict(title="BSI"),
-                opacity=0.9
-            ),
-            name="Buckling severity"
-        ))
-        fig3d_bsi.update_layout(
-            title="3D wellpath coloured by buckling severity",
-            height=520,
-            scene=dict(
-                xaxis_title="East (ft)",
-                yaxis_title="North (ft)",
-                zaxis_title="TVD (ft)",
-                zaxis=dict(autorange="reversed"),
-                bgcolor="black"
-            ),
-            paper_bgcolor="black",
-            font=dict(color="white"),
-            margin=dict(l=10, r=10, t=40, b=10),
-            legend=dict(orientation="h"),
-        )
+        BSI_for_nodes = np.empty_like(md); BSI_for_nodes[:] = np.nan; BSI_for_nodes[1:] = BSI
+        mask_valid = ~np.isnan(BSI_for_nodes)
+        fig3d_bsi.add_trace(go.Scatter3d(x=E, y=N, z=TVD, mode="lines", line=dict(width=4, color="rgba(200,200,200,0.4)"), name="Wellpath"))
+        fig3d_bsi.add_trace(go.Scatter3d(x=E[mask_valid], y=N[mask_valid], z=TVD[mask_valid], mode="markers",
+                                         marker=dict(size=5, color=BSI_for_nodes[mask_valid], colorscale="Turbo", cmin=1.0, cmax=4.0,
+                                                     colorbar=dict(title="BSI"), opacity=0.9), name="Buckling severity"))
+        fig3d_bsi.update_layout(title="3D wellpath coloured by buckling severity", height=520,
+                                scene=dict(xaxis_title="East (ft)", yaxis_title="North (ft)", zaxis_title="TVD (ft)", zaxis=dict(autorange="reversed"), bgcolor="black"),
+                                paper_bgcolor="black", font=dict(color="white"), margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
 
         c5, c6 = st.columns(2)
-        with c5:
-            st.plotly_chart(fig_buck, use_container_width=True)
-        with c6:
-            st.plotly_chart(fig_bsi, use_container_width=True)
-
+        with c5: st.plotly_chart(fig_buck, use_container_width=True)
+        with c6: st.plotly_chart(fig_bsi, use_container_width=True)
         st.plotly_chart(fig3d_bsi, use_container_width=True)
 
     # ───────── Friction calibration (history match)
@@ -1040,7 +897,7 @@ with tab:
                 mu_ranges=mu_ranges
             )
             if best is None:
-                st.warning("Provide at least one measurement (pickup/slackoff/rotate).")
+                st.warning("Provide at least one measurement (pickup/slackoff/rotate).");
             else:
                 st.session_state["μ_fit"] = best
                 st.success(f"Fitted μ: casing(slide)={best['mu_c_s']:.2f}, open(slide)={best['mu_o_s']:.2f}, "
@@ -1053,6 +910,9 @@ with tab:
     st.dataframe(df_itr.head(12), use_container_width=True)
 
     st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. Defaults: last casing 9-5/8, OH 8.50 in. "
-               "Tools include history-matching μ, calibrated overlay, NP check, 0.8×MU gate, BSR/SR, tortuosity penalty, motor bit torque, "
-               "and rig-limit margins, plus Menand-style buckling loads, drag μ-sensitivity, ProWellPlan-style operation comparisons, "
-               "and a buckling severity indicator (BSI) including a 3D hot-spot view.")
+               "Tools include
+
+
+
+
+

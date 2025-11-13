@@ -200,7 +200,7 @@ def neutral_point_md(md: np.ndarray, T_arr: np.ndarray) -> float:
 
 # NEW (slides): simple neutral point estimate z_NP = BF * L
 def neutral_point_simple(mw_ppg: float, length_from_bit_ft: float) -> float:
-    \"\"\"Slide-style neutral point: BF * L (no sign change required).\"\"\"
+    """Slide-style neutral point: BF * L (no sign change required)."""
     BF = bf_from_mw(mw_ppg)
     return BF * max(0.0, float(length_from_bit_ft))
 

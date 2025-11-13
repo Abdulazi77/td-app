@@ -1,13 +1,3 @@
-# streamlit_app.py
-# -*- coding: utf-8 -*-
-"""
-PEGN 517 — Wellpath + Torque & Drag (Δs = 1 ft)
-Single-tab linked workflow with calibration, NP, 0.8×MU, BSR/SR, tortuosity, motor-BT,
-rig-limit margins, hole-cleaning booster, and calibrated μ overlay (dashed).
-
-Libraries needed: streamlit, plotly, numpy, pandas
-"""
-
 from __future__ import annotations
 import math
 from typing import Dict, Iterable, Tuple, List, Optional
@@ -23,6 +13,8 @@ st.set_page_config(page_title="Wellpath + Torque & Drag (Δs = 1 ft)", layout="w
 # ─────────────────────────── Constants ──────────────────────────
 DEG2RAD = math.pi / 180.0
 IN2FT   = 1.0/12.0
+LBF_TO_KN = 4.4482216152605 / 1000.0        # lbf → kN
+LBF_FT_TO_KNM = 1.3558179483314 / 1000.0    # lbf-ft → kN·m
 
 def clamp(x: float, lo: float, hi: float) -> float: return max(lo, min(hi, x))
 def bf_from_mw(mw_ppg: float) -> float: return (65.5 - mw_ppg)/65.5  # steel ~65.5 ppg
@@ -422,7 +414,7 @@ with tab:
 
     depth = df_itr["md_bot_ft"].to_numpy()
 
-    # FIX: hookload is magnitude of axial force at surface
+    # hookload magnitude and surface torque magnitude
     surf_hookload = abs(T_arr[-1])
     surf_torque  = abs(M_arr[-1])
     st.success(f"Surface hookload: {surf_hookload:,.0f} lbf — Surface torque: {surf_torque:,.0f} lbf-ft")
@@ -820,6 +812,47 @@ with tab:
 
         st.plotly_chart(fig_drag, use_container_width=True)
 
+        # ───────── NEW: ProWellPlan-style operation comparison ─────────
+        st.markdown("### Operation comparison — drag & torque for Lowering / Rotating / Hoisting")
+
+        def run_scenario(scenario_name: str):
+            df_s, T_s, M_s = soft_string_stepper(
+                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+                mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
+                mw_ppg, scenario=scenario_name, WOB_lbf=wob, Mbit_ftlbf=Mbit,
+                tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+            )
+            depth_s = df_s["md_bot_ft"].to_numpy()
+            drag_kN = np.abs(df_s["T_next_lbf"].to_numpy()) * LBF_TO_KN
+            tor_kNm = np.abs(df_s["M_next_lbf_ft"].to_numpy()) * LBF_FT_TO_KNM
+            return depth_s, drag_kN, tor_kNm
+
+        depth_low, drag_low, tq_low = run_scenario("slackoff")
+        depth_rot, drag_rot, tq_rot = run_scenario("rotate_off")
+        depth_hst, drag_hst, tq_hst = run_scenario("pickup")
+
+        fig_drag_ops = go.Figure()
+        fig_drag_ops.add_trace(go.Scatter(x=drag_low, y=depth_low, mode="lines", name="Lowering"))
+        fig_drag_ops.add_trace(go.Scatter(x=drag_rot, y=depth_rot, mode="lines", name="Rotating"))
+        fig_drag_ops.add_trace(go.Scatter(x=drag_hst, y=depth_hst, mode="lines", name="Hoisting"))
+        fig_drag_ops.update_yaxes(autorange="reversed", title_text="Depth (ft)")
+        fig_drag_ops.update_xaxes(title_text="Drag force (kN)")
+        fig_drag_ops.update_layout(height=450, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
+
+        fig_tq_ops = go.Figure()
+        fig_tq_ops.add_trace(go.Scatter(x=tq_low, y=depth_low, mode="lines", name="Lowering"))
+        fig_tq_ops.add_trace(go.Scatter(x=tq_rot, y=depth_rot, mode="lines", name="Rotating"))
+        fig_tq_ops.add_trace(go.Scatter(x=tq_hst, y=depth_hst, mode="lines", name="Hoisting"))
+        fig_tq_ops.update_yaxes(autorange="reversed", title_text="Depth (ft)")
+        fig_tq_ops.update_xaxes(title_text="Torque (kN·m)")
+        fig_tq_ops.update_layout(height=450, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
+
+        c_ops1, c_ops2 = st.columns(2)
+        with c_ops1:
+            st.plotly_chart(fig_drag_ops, use_container_width=True)
+        with c_ops2:
+            st.plotly_chart(fig_tq_ops, use_container_width=True)
+
         # ───────── Advanced buckling views ─────────
         st.markdown("### Advanced buckling views (compression, BSI & 3D severity)")
 
@@ -994,4 +1027,5 @@ with tab:
 
     st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. Defaults: last casing 9-5/8, OH 8.50 in. "
                "Tools include history-matching μ, calibrated overlay, NP check, 0.8×MU gate, BSR/SR, tortuosity penalty, motor bit torque, "
-               "and rig-limit margins, plus Menand-style buckling loads, drag μ-sensitivity, and a buckling severity indicator (BSI) including a 3D hot-spot view.")
+               "and rig-limit margins, plus Menand-style buckling loads, drag μ-sensitivity, ProWellPlan-style operation comparisons, "
+               "and a buckling severity indicator (BSI) including a 3D hot-spot view.")

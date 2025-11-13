@@ -188,7 +188,7 @@ def soft_string_stepper(
 
 # ───────────────────── Helper diagnostics ────────────────────────
 def neutral_point_md(md: np.ndarray, T_arr: np.ndarray) -> float:
-    \"\"\"Return MD where axial force crosses zero (bit→surface array). NaN if none.\"\"\"
+    """Return MD where axial force crosses zero (bit→surface array). NaN if none."""
     if len(md) < 2 or len(T_arr) < 2: return float('nan')
     for i in range(len(T_arr)-1):
         t1, t2 = T_arr[i], T_arr[i+1]

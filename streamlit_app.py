@@ -1,8 +1,3 @@
-# Write the provided code block to a plain text file exactly as-is (with the single fix: remove the leading
-# explanatory comment lines so the script can be run directly with Python to generate the output file).
-#
-# File will be saved at /mnt/data/streamlit_app_with_NP_simple.txt
-
 from __future__ import annotations
 import math
 from typing import Dict, Iterable, Tuple, List, Optional
@@ -698,8 +693,8 @@ with tab:
         hookload_along = np.abs(df_itr['T_next_lbf'].to_numpy())/1000.0
         fig_hl.add_trace(go.Scatter(x=hookload_along, y=depth, mode="lines", name="Hookload (|T|)"))
         fig_hl.add_vline(x=rig_pull_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Rig pull limit")
-        fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Sinusoidal Fs", line=dict(dash="dash")))
-        fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Helical Fh", line=dict(dash="dot")))
+        fig_hl.add_trace(go.Scatter(x=Fs/1000.0, y=depth, name="Fs (sinusoidal)", line=dict(dash="dash")))
+        fig_hl.add_trace(go.Scatter(x=Fh/1000.0, y=depth, name="Fh (helical)", line=dict(dash="dot")))
         fig_hl.add_trace(go.Scatter(x=BSI, y=depth, name="BSI (1–4)", line=dict(width=4, color="red")))
         fig_hl.update_yaxes(autorange="reversed", title_text="Depth (ft)")
         fig_hl.update_xaxes(title_text="Hookload / Fs / Fh (k lbf) & BSI")
@@ -913,8 +908,3 @@ with tab:
 
     st.caption("Johancsik soft-string (Δs=1 ft). Survey → shoe → T&D are linked. Defaults: last casing 9-5/8, OH 8.50 in. "
                "Tools include
-
-
-
-
-

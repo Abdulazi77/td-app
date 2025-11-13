@@ -172,7 +172,7 @@ def soft_string_stepper(
     sgn_ax = {"pickup": +1.0, "slackoff": -1.0}.get(scenario, 0.0)
 
     for i in range(nseg):
-        # PHYSICS FIX: side-force cannot be negative
+        # side-force cannot be negative
         N_raw = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
         N_side[i] = max(0.0, N_raw)
 
@@ -491,6 +491,28 @@ with tab:
                 f"casing(rot)={mu_fit['mu_c_r']:.2f}, open(rot)={mu_fit['mu_o_r']:.2f}"
             )
 
+    # OPTIONAL: measured torque vs depth CSV (two columns: MD_ft, Torque_kft)
+    measured_torque_file = None
+    meas_md = None
+    meas_tq_kft = None
+    with st.expander("Optional: upload measured torque vs depth for overlay"):
+        measured_torque_file = st.file_uploader("CSV with columns MD_ft, Torque_ftlbf (or Torque_kft)", type=["csv"])
+        if measured_torque_file is not None:
+            try:
+                df_meas = pd.read_csv(measured_torque_file)
+                if "Torque_kft" in df_meas.columns:
+                    meas_tq_kft = df_meas["Torque_kft"].to_numpy()
+                elif "Torque_ftlbf" in df_meas.columns:
+                    meas_tq_kft = df_meas["Torque_ftlbf"].to_numpy()/1000.0
+                else:
+                    st.warning("CSV must contain Torque_kft or Torque_ftlbf; overlay skipped.")
+                if "MD_ft" in df_meas.columns:
+                    meas_md = df_meas["MD_ft"].to_numpy()
+                else:
+                    st.warning("CSV must contain MD_ft column; overlay skipped.")
+            except Exception as e:
+                st.warning(f"Could not read measured torque CSV: {e}")
+
     if simple_mode:
         figT = go.Figure(go.Scatter(x=df_itr["md_bot_ft"], y=np.abs(df_itr["M_next_lbf_ft"]), mode="lines", name="Torque"))
         figT.update_xaxes(title_text="MD (ft)"); figT.update_yaxes(title_text="Torque (lbf-ft)")
@@ -501,7 +523,22 @@ with tab:
         with c2x: st.plotly_chart(figH, use_container_width=True)
     else:
         st.markdown("### T&D Model Chart — Risk curves and limits")
-        mu_band = st.multiselect("μ sweep for off-bottom risk curves", [0.15,0.20,0.25,0.30,0.35,0.40], default=[0.20,0.25,0.30,0.35])
+        mu_band = st.multiselect(
+            "μ sweep for off-bottom risk curves",
+            [0.15,0.20,0.25,0.30,0.35,0.40],
+            default=[0.20,0.25,0.30,0.35]
+        )
+
+        # ensure sorted μ and consistent color map
+        mu_band = sorted(mu_band)
+        mu_colors = {
+            0.15: "#5bc0de",
+            0.20: "#1f77b4",
+            0.25: "#17becf",
+            0.30: "#ff7f0e",
+            0.35: "#d62728",
+            0.40: "#9467bd",
+        }
 
         T_makeup_sf = TOOL_JOINT_DB[tj_name]['T_makeup_ftlbf']/sf_joint
         T_yield_sf  = TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint
@@ -515,36 +552,121 @@ with tab:
             )
             return df_tmp["md_bot_ft"].to_numpy(), np.abs(df_tmp["M_next_lbf_ft"].to_numpy())
 
-        # LEFT: μ-sweep off-bottom torque vs depth
+        # LEFT: μ-sweep off-bottom torque vs depth (enhanced)
         fig_left = go.Figure()
+
+        # background bands: safe (0–0.8 MU), warning (0.8 MU–rig torque), danger (rig torque+)
+        x_safe_max = T_makeup_sf/1000.0
+        x_warn_max = rig_torque_lim/1000.0
+
+        fig_left.add_shape(
+            type="rect",
+            x0=0, x1=x_safe_max, y0=min(depth), y1=max(depth),
+            fillcolor="rgba(0,128,0,0.05)", line_width=0, layer="below"
+        )
+        fig_left.add_shape(
+            type="rect",
+            x0=x_safe_max, x1=x_warn_max, y0=min(depth), y1=max(depth),
+            fillcolor="rgba(255,165,0,0.06)", line_width=0, layer="below"
+        )
+        fig_left.add_shape(
+            type="rect",
+            x0=x_warn_max, x1=x_warn_max*1.3, y0=min(depth), y1=max(depth),
+            fillcolor="rgba(255,0,0,0.05)", line_width=0, layer="below"
+        )
+
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu, mu)
             fig_left.add_trace(go.Scatter(
-                x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines",
-                hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft"
+                x=tmu/1000.0,
+                y=dmu,
+                name=f"μ={mu:.2f}",
+                mode="lines",
+                line=dict(color=mu_colors.get(mu, None)),
+                customdata=np.full_like(dmu, mu, dtype=float),
+                hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<br>μ=%{customdata:.2f}<extra></extra>"
             ))
-        fig_left.add_vline(x=T_makeup_sf/1000.0, line_color="#00d5ff", line_dash="dash",
-                           annotation_text="Make-up / SF")
-        fig_left.update_yaxes(autorange="reversed", title_text="Depth (ft)")
-        fig_left.update_xaxes(title_text="Off-bottom torque (k lbf-ft)")
-        fig_left.update_layout(height=680, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
 
-        # overlay calibrated (off-bottom)
+        # μ-calibrated overlay
         if overlay_calibrated and mu_fit is not None:
             dcal, tcal = run_td_off_bottom(mu_fit['mu_o_s'], mu_fit['mu_o_r'])
             fig_left.add_trace(
-                go.Scatter(x=tcal/1000.0, y=dcal, mode="lines",
-                           name="μ (calibrated, off-bottom)", line=dict(dash="dash"))
+                go.Scatter(
+                    x=tcal/1000.0,
+                    y=dcal,
+                    mode="lines",
+                    name="μ (calibrated, off-bottom)",
+                    line=dict(dash="dash", width=3)
+                )
             )
 
-        # RIGHT: elemental torque + limits
+        # limits
+        fig_left.add_vline(
+            x=T_makeup_sf/1000.0,
+            line_color="#00d5ff",
+            line_dash="dash",
+            annotation_text="Make-up / SF",
+            annotation_position="top"
+        )
+        fig_left.add_vline(
+            x=rig_torque_lim/1000.0,
+            line_color="magenta",
+            line_dash="dot",
+            annotation_text="TD limit",
+            annotation_position="top"
+        )
+
+        # casing vs open hole marker at shoe
+        fig_left.add_hline(
+            y=shoe_md,
+            line_dash="dot",
+            line_color="#888888",
+            annotation_text="Shoe depth",
+            annotation_position="right"
+        )
+
+        # measured torque overlay (if provided)
+        if meas_md is not None and meas_tq_kft is not None:
+            fig_left.add_trace(
+                go.Scatter(
+                    x=meas_tq_kft,
+                    y=meas_md,
+                    mode="markers+lines",
+                    name="Measured torque",
+                    marker=dict(symbol="circle-open", size=7),
+                    line=dict(width=1, dash="dot"),
+                    hovertemplate="Measured: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<extra></extra>"
+                )
+            )
+
+        fig_left.update_yaxes(
+            autorange="reversed",
+            title_text="Depth (ft)",
+            tick0=0,
+            dtick=1000,
+            showgrid=True
+        )
+        fig_left.update_xaxes(
+            title_text="Off-bottom torque (k lbf-ft)",
+            tickformat=".1f",
+            showgrid=True
+        )
+        fig_left.update_layout(
+            title="Surface Torque vs Depth — Off-bottom μ Sensitivity",
+            height=680,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0)
+        )
+
+        # RIGHT: elemental torque + limits (unchanged)
         fig_right = go.Figure()
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu, mu)
             if tmu[0] < tmu[-1]: tmu = tmu[::-1]
             fig_right.add_trace(go.Scatter(
                 x=tmu/1000.0, y=dmu, name=f"μ={mu:.2f}", mode="lines",
-                hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft"
+                line=dict(color=mu_colors.get(mu, None)),
+                hovertemplate="Torque: %{x:.2f} k lbf-ft<br>MD: %{y:.0f} ft<extra></extra>"
             ))
         fig_right.add_vline(x=T_makeup_sf/1000.0,  line_color="#00d5ff", line_dash="dash", annotation_text="Make-up / SF")
         fig_right.add_vline(x=rig_torque_lim/1000.0, line_color="magenta", line_dash="dot", annotation_text="Top-drive limit")

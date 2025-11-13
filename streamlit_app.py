@@ -811,21 +811,48 @@ with tab:
         )
 
         st.plotly_chart(fig_drag, use_container_width=True)
+        # ───────── Baseline (friction-free) hookload for drag reference ─────────
+        # This represents the buoyed string weight with μ = 0 (no drag).
+        df_free, T_free, _ = soft_string_stepper(
+            md, inc_deg, kappa, (md <= shoe_md), comp_along, comp_props,
+            0.0, 0.0, 0.0, 0.0, mw_ppg,
+            scenario="pickup", WOB_lbf=0.0, Mbit_ftlbf=0.0,
+            tortuosity_mode="off", tau=0.0, mu_open_boost=0.0
+        )
+        HL_free = np.abs(df_free["T_next_lbf"].to_numpy())
 
         # ───────── NEW: ProWellPlan-style operation comparison ─────────
         st.markdown("### Operation comparison — drag & torque for Lowering / Rotating / Hoisting")
 
-        def run_scenario(scenario_name: str):
+                def run_scenario(scenario_name: str):
+            """
+            Return:
+              depth_s      – MD (ft)
+              drag_kN      – |HL_scenario - HL_free| in kN  (drag)
+              tor_kNm      – |M| in kN·m
+            """
             df_s, T_s, M_s = soft_string_stepper(
-                md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
+                md, inc_deg, kappa, (md <= shoe_md), comp_along, comp_props,
                 mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
                 mw_ppg, scenario=scenario_name, WOB_lbf=wob, Mbit_ftlbf=Mbit,
                 tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
             )
+
             depth_s = df_s["md_bot_ft"].to_numpy()
-            drag_kN = np.abs(df_s["T_next_lbf"].to_numpy()) * LBF_TO_KN
-            tor_kNm = np.abs(df_s["M_next_lbf_ft"].to_numpy()) * LBF_FT_TO_KNM
+            HL_s    = np.abs(df_s["T_next_lbf"].to_numpy())
+
+            # Make sure we’re aligned with the friction-free baseline
+            n = min(len(HL_s), len(HL_free))
+            HL_s    = HL_s[:n]
+            depth_s = depth_s[:n]
+            M_s_arr = np.abs(df_s["M_next_lbf_ft"].to_numpy())[:n]
+
+            # DRAG = difference between actual HL and friction-free HL
+            drag_kN = np.abs(HL_s - HL_free[:n]) * LBF_TO_KN
+            tor_kNm = M_s_arr * LBF_FT_TO_KNM
+
             return depth_s, drag_kN, tor_kNm
+
 
         depth_low, drag_low, tq_low = run_scenario("slackoff")
         depth_rot, drag_rot, tq_rot = run_scenario("rotate_off")

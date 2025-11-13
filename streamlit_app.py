@@ -1,3 +1,4 @@
+# /app/main.py
 from __future__ import annotations
 import math
 from typing import Dict, Iterable, Tuple, List, Optional
@@ -112,13 +113,11 @@ def soft_string_stepper(
     tau: float = 0.0,                # 0.0 .. 0.5 typ
     mu_open_boost: float = 0.0,      # hole cleaning booster
 ):
-    
     """
     Δs = 1 ft soft-string integration, bit -> surface.
     scenario: "pickup" | "slackoff" | "rotate_off" | "onbottom"
     tortuosity_mode: inflate kappa or mu by (1+tau) in OPEN-HOLE segments.
     """
-    
     ds = 1.0
     md = np.asarray(md); inc_deg = np.asarray(inc_deg)
     nseg = len(md) - 1
@@ -163,7 +162,8 @@ def soft_string_stepper(
         T[0] = -float(WOB_lbf)       # compressive at bit → negative
         M[0] = float(Mbit_ftlbf)     # motor / bit torque allowed
 
-    sgn_ax = {"pickup": +1.0, "slackoff": -1.0}.get(scenario, 0.0)
+    # IMPORTANT: include axial body weight on-bottom
+    sgn_ax = {"pickup": +1.0, "slackoff": -1.0, "onbottom": -1.0}.get(scenario, 0.0)
 
     for i in range(nseg):
         N_raw = w_b[i]*math.sin(inc[i]) + T[i]*kappa_seg[i]
@@ -198,11 +198,28 @@ def neutral_point_md(md: np.ndarray, T_arr: np.ndarray) -> float:
             return md[i] + frac*(md[i+1]-md[i])
     return float('nan')
 
-# NEW (slides): simple neutral point estimate z_NP = BF * L
+# LEGACY: slide-style neutral point z_NP = BF * L (kept for reference uses elsewhere)
 def neutral_point_simple(mw_ppg: float, length_from_bit_ft: float) -> float:
     """Slide-style neutral point: BF * L (no sign change required)."""
     BF = bf_from_mw(mw_ppg)
     return BF * max(0.0, float(length_from_bit_ft))
+
+# NEW: slide-correct NP based on WOB & DC buoyant weight
+def neutral_point_length_from_wob(
+    WOB_lbf: float,
+    mw_ppg: float,
+    w_air_dc_lbft: float,
+    Kb: float = 1.0,
+) -> float:
+    """
+    x_np = WOB / (K_b * w_b,DC), w_b,DC = w_air,DC * BF
+    Returns x_np in ft from bit, **inside DCs**.
+    """
+    BF = bf_from_mw(mw_ppg)
+    w_b_dc = w_air_dc_lbft * BF
+    if w_b_dc <= 0 or Kb <= 0:
+        return float("nan")
+    return float(WOB_lbf) / (Kb * w_b_dc)
 
 def grid_calibrate_mu(
     md, inc_deg, kappa, cased_mask, comp_along, comp_props, mw_ppg,
@@ -253,7 +270,7 @@ def grid_calibrate_mu(
                         best = dict(mu_c_s=mu_c_s, mu_o_s=mu_o_s, mu_c_r=mu_c_r, mu_o_r=mu_o_r, SSE=best_err)
     return best
 
-# ─────────────────────────────── UI ──────────────────────────────
+# ─────────────────────────────── UI ─────────────────────────────
 (tab,) = st.tabs(["Wellpath + Torque & Drag (linked)"])
 
 with tab:
@@ -446,7 +463,25 @@ with tab:
     st.info(f"0.8×Make-up = {T80/1000:.1f} k lbf-ft — Surface torque = {surf_torque/1000:.2f} k → {'PASS ✅' if passed_80 else 'FAIL ❌'} (margin {torque_margin/1000:.2f} k)")
     st.caption("Why this? The lecture recommends staying ≤ ~80% of TJ make-up; it’s a conservative gate.")
 
-    # Neutral point — model sign-change AND slide formula
+    # ───────── Neutral point — slide formula (analytic) + model sign-change
+    st.subheader("Neutral Point (NP)")
+    # Analytic (slides)
+    Kb = st.number_input("Buckling factor K_b", 0.5, 2.0, 1.0, 0.05)
+    x_np_dc = neutral_point_length_from_wob(
+        WOB_lbf=wob, mw_ppg=mw_ppg, w_air_dc_lbft=dc_w, Kb=Kb
+    )
+    SF_np = st.number_input("Safety factor SF for DC length", 1.0, 2.0, 1.15, 0.05)
+    Lc_req = SF_np * x_np_dc
+
+    st.write(
+        f"Analytical NP (in DCs, no friction): **{x_np_dc:,.0f} ft from bit**  "
+        f"(BF={bf_from_mw(mw_ppg):.3f}, DC w_air={dc_w:.1f} lb/ft, K_b={Kb:.2f})"
+    )
+    st.write(f"Recommended DC length L_c = SF × x_np ≈ **{Lc_req:,.0f} ft**")
+    st.write(f"Current DC length = **{dc_len:,.0f} ft** → "
+             f"{'✅ OK' if dc_len >= Lc_req else '⚠️ Too short — increase DC length'}")
+
+    # Model sign-change (Johancsik)
     df_on, T_on, _ = soft_string_stepper(
         md, inc_deg, kappa, (md<=shoe_md), comp_along, comp_props,
         mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
@@ -454,21 +489,15 @@ with tab:
         tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
     )
     np_md = neutral_point_md(md, np.array(T_on))
-    # slide-style estimate: L = string length in hole (limited by MD)
-    L_string = min(float(md[-1]), float(dc_len + hwdp_len + dp_len))
-    np_simple_from_bit = neutral_point_simple(mw_ppg, L_string)  # BF * L
-
     if math.isnan(np_md):
-        st.warning("Neutral point not found by sign-change. Using slide formula (BF × L).")
-        st.write(f"Neutral point (slide formula) ≈ **{np_simple_from_bit:,.0f} ft from bit**  (BF={bf_from_mw(mw_ppg):.4f}, L={L_string:,.0f} ft)")
+        st.info("Johancsik model: no sign change (entire string compressive near bit). Compare against analytical NP above.")
     else:
-        NP_from_bit = md[-1] - np_md
-        st.write(f"Neutral point (model) ≈ **{NP_from_bit:,.0f} ft from bit**")
-        st.caption(f"Slide formula check → BF×L ≈ {np_simple_from_bit:,.0f} ft (BF={bf_from_mw(mw_ppg):.4f}, L={L_string:,.0f} ft)")
-        in_DCs = NP_from_bit <= dc_len
-        st.write(f"→ {'✅ inside DCs' if in_DCs else '❌ not inside DCs'}")
-        if not in_DCs:
-            st.warning("Increase DC length so NP sits inside the collars for current WOB.")
+        NP_from_bit_model = md[-1] - np_md
+        st.write(
+            f"T&D model NP (incl. friction): **{NP_from_bit_model:,.0f} ft from bit** "
+            f"(full string)."
+        )
+        st.caption(f"Expect differences vs analytic NP if deviation/friction is significant.")
 
     # BSR & SR quick checks
     st.subheader("Connection checks — BSR & SR (rule-of-thumb)")
@@ -652,7 +681,8 @@ with tab:
         A_local  = np.array([A_in2(o, i) for o, i in zip(od_local, id_local)])
         J_local  = np.array([J_in4(o, i) for o, i in zip(od_local, id_local)])
 
-        hole_d_profile = np.where(df_itr["cased?"].to_numpy(), 2.0*casing_id_in, hole_diam_in)
+        # FIX: correct hole diameter in cased hole (no *2)
+        hole_d_profile = np.where(df_itr["cased?"].to_numpy(), casing_id_in, hole_diam_in)
         r_ft_local = np.maximum(1e-4, 0.5*(hole_d_profile - od_local) * IN2FT)
 
         EI_factor = EI_lbf_ft2_from_in4(Epsi, 1.0)

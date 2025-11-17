@@ -1,3 +1,7 @@
+# File: Final Code Oct14.py
+# Streamlit app: Wellpath + Torque & Drag (Δs = 1 ft)
+# NOTE: This version adds three classic graphs (Drill String Profile, Tension @ TMD, Surface Torque RoB vs depth)
+#       They are integrated with the Oct 14 model variables and update dynamically with inputs.
 
 from __future__ import annotations
 import math
@@ -656,6 +660,10 @@ with tab:
                                margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0))
 
         # RIGHT: elemental torque + limits
+        T_makeup_sf = TOOL_JOINT_DB[tj_name]['T_makeup_ftlbf']/sf_joint
+        T_yield_sf  = TOOL_JOINT_DB[tj_name]['T_yield_ftlbf']/sf_joint
+        F_tensile_sf= TOOL_JOINT_DB[tj_name]['F_tensile_lbf']/sf_tension
+
         fig_right = go.Figure()
         for mu in mu_band:
             dmu, tmu = run_td_off_bottom(mu, mu)
@@ -910,6 +918,104 @@ with tab:
                                 paper_bgcolor="black", font=dict(color="white"), margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
         st.plotly_chart(fig3d_bsi, use_container_width=True)
         st.caption("**How to read:** Left: compression vs critical loads. Middle: BSI (1–4) with hookload on a twin x-axis. Bottom: the same BSI shown along the 3D path of the portion of the well occupied by the string.")
+
+    # ───────────────────────────────────────────────────────────────────────
+    # NEW: Classic Oct-14 graphs (exactly the last three shown in your images)
+    # ───────────────────────────────────────────────────────────────────────
+    st.markdown("## Classic Oct-14 graphs (3 plots)")
+
+    # (A) Tension profile along drill string at TMD (RiH/PooH/RoB/ROB)
+    def _tension_series_for(scenario_name: str, wob_val: float = 0.0, mbit: float = 0.0):
+        df_s, _, _ = soft_string_stepper(
+            md_run, inc_deg_run, kappa, cased_mask, comp_along, comp_props,
+            mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
+            mw_ppg, scenario=scenario_name, WOB_lbf=wob_val, Mbit_ftlbf=mbit,
+            tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+        )
+        return df_s["md_bot_ft"].to_numpy(), np.abs(df_s["T_next_lbf"].to_numpy())
+
+    md_r, T_rih = _tension_series_for("slackoff", 0.0, 0.0)   # RiH
+    _,    T_pooh= _tension_series_for("pickup",   0.0, 0.0)   # PooH
+    _,    T_robf= _tension_series_for("rotate_off", 0.0, 0.0) # RoB (off-bottom)
+    _,    T_rob = _tension_series_for("onbottom", wob, Mbit)   # ROB (on-bottom)
+
+    fig_tension = go.Figure()
+    fig_tension.add_trace(go.Scatter(x=T_rih, y=md_r, mode="lines", name="RiH"))
+    fig_tension.add_trace(go.Scatter(x=T_pooh, y=md_r, mode="lines", name="PooH"))
+    fig_tension.add_trace(go.Scatter(x=T_robf, y=md_r, mode="lines", name="RoB"))
+    fig_tension.add_trace(go.Scatter(x=T_rob,  y=md_r, mode="lines", name="ROB"))
+    fig_tension.update_layout(title="Tension profile along drill string at TMD",
+                              xaxis_title="Tension (lb)", yaxis_title="MD (ft)",
+                              yaxis=dict(autorange="reversed"), height=520, margin=dict(l=10,r=10,t=40,b=10),
+                              legend=dict(title="Activity"))
+    # (B) Surface Torque while Rotating off Bottom vs depth (green curve)
+    # iterate over open-hole depths of md_run
+    open_idx = np.where(~cased_mask)[0]
+    tq_depth = []
+    tq_surface = []
+    if len(open_idx) > 0:
+        start_open = open_idx[0]  # first open-hole segment index
+        for i in range(start_open, len(md_run)):  # grow the interval
+            md_sub = md_run[:i+1]
+            inc_sub = inc_deg_run[:i+1]
+            kappa_sub = kappa[:i] if len(kappa) >= i else kappa
+            cased_sub = cased_mask[:i]
+            comp_sub  = comp_along[:i] if len(comp_along) >= i else comp_along
+            if len(md_sub) < 2:   # skip degenerate
+                continue
+            df_sub, _, M_sub = soft_string_stepper(
+                md_sub, inc_sub, kappa_sub, cased_sub, comp_sub, comp_props,
+                mu_cased_slide, mu_open_slide, mu_cased_rot, mu_open_rot,
+                mw_ppg, scenario="rotate_off",
+                WOB_lbf=0.0, Mbit_ftlbf=0.0,
+                tortuosity_mode=tort_mode, tau=tau, mu_open_boost=mu_boost
+            )
+            tq_depth.append(md_sub[-1])
+            tq_surface.append(abs(M_sub[-1]))
+    fig_surface_tq = go.Figure()
+    if tq_depth:
+        fig_surface_tq.add_trace(go.Scatter(x=tq_surface, y=tq_depth, mode="lines", name="RoB", line=dict(color="green")))
+    fig_surface_tq.update_layout(title="Surface Torques Rotating off Bottom\nwhile drilling open hole section",
+                                 xaxis_title="Torque (ft-lb)", yaxis_title="MD (ft)",
+                                 yaxis=dict(autorange="reversed"), height=520, margin=dict(l=10,r=10,t=40,b=10),
+                                 legend=dict(title="Activity"))
+
+    # (C) Drill String Profile (vertical stick)
+    # compute contiguous ranges at TMD
+    md_top = md[0]; md_tmd = md[-1]
+    y_dc_top    = md_tmd
+    y_dc_bot    = max(md_tmd - dc_len, md_top)
+    y_hwdp_bot  = max(y_dc_bot - hwdp_len, md_top)
+    y_dp_bot    = max(y_hwdp_bot - dp_len, md_top)
+
+    scale = 6.0  # visual width scale (why: make OD differences visible)
+    fig_ds = go.Figure()
+    # DP
+    if y_dp_bot < y_hwdp_bot:
+        fig_ds.add_trace(go.Scatter(x=[0,0], y=[y_dp_bot, y_hwdp_bot], mode="lines",
+                                    line=dict(width=max(1, dp_od*scale), color="#808080"), name="DP",
+                                    hovertemplate=f"DP<br>OD: {dp_od:.2f} in<br>ID: {dp_id:.2f} in<extra></extra>"))
+    # HWDP
+    if y_hwdp_bot < y_dc_bot:
+        fig_ds.add_trace(go.Scatter(x=[0,0], y=[y_hwdp_bot, y_dc_bot], mode="lines",
+                                    line=dict(width=max(1, hwdp_od*scale), color="#6c6c6c"), name="HWDP",
+                                    hovertemplate=f"HWDP<br>OD: {hwdp_od:.2f} in<br>ID: {hwdp_id:.2f} in<extra></extra>"))
+    # DC
+    if y_dc_bot < y_dc_top:
+        fig_ds.add_trace(go.Scatter(x=[0,0], y=[y_dc_bot, y_dc_top], mode="lines",
+                                    line=dict(width=max(1, dc_od*scale), color="#4d4d4d"), name="DC",
+                                    hovertemplate=f"DC<br>OD: {dc_od:.2f} in<br>ID: {dc_id:.2f} in<extra></extra>"))
+
+    fig_ds.update_layout(title="Drill String Profile", height=700, margin=dict(l=10,r=10,t=40,b=10),
+                         showlegend=False)
+    fig_ds.update_yaxes(title="Measured Depth (ft)", autorange="reversed", range=[md_tmd, md_top])
+    fig_ds.update_xaxes(visible=False)
+
+    # Layout: two columns top, full-width bottom
+    g1, g2 = st.columns(2)
+    with g1: st.plotly_chart(fig_tension, use_container_width=True)
+    with g2: st.plotly_chart(fig_surface_tq, use_container_width=True)
+    st.plotly_chart(fig_ds, use_container_width=True)
 
     # ───────── Friction calibration (history match)
     st.subheader("Friction calibration (history match at a depth)")
